@@ -31,6 +31,10 @@ from dolphin.api import STABLE_CHROME_VERSION, DolphinAPI
 from dolphin.apikey import api_key
 
 ENV_FILE = ROOT / ".env"
+USAGE_FILE = ROOT / "freenumber_usage.json"
+MAX_FREE_NUMBER_USES = 20
+ANOSIM_LOGIN = "https://anosim.net/login"
+ANOSIM_NUMBERS = "https://anosim.net/freenumbers/germany"
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
@@ -1013,20 +1017,272 @@ def select_option(cdp: Cdp, selector: str, value: str) -> str:
     return str(selected or "")
 
 
-def fill_phone(cdp: Cdp, prefix: str, phone: str) -> None:
+def load_usage() -> dict[str, int]:
+    if not USAGE_FILE.is_file():
+        return {}
+    try:
+        raw = json.loads(USAGE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    usage: dict[str, int] = {}
+    for key, value in raw.items():
+        try:
+            usage[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return usage
+
+
+def save_usage(usage: dict[str, int]) -> None:
+    USAGE_FILE.write_text(json.dumps(usage, indent=2), encoding="utf-8")
+
+
+def record_number_use(number: str) -> int:
+    usage = load_usage()
+    count = usage.get(number, 0) + 1
+    usage[number] = count
+    save_usage(usage)
+    return count
+
+
+def anosim_test_mode() -> bool:
+    return os.environ.get("ANOSIM_MODE", "").strip().lower() in {"test", "1", "true", "yes"}
+
+
+def bump_phone(number: str) -> str:
+    raw = number.strip()
+    digits = raw.lstrip("+")
+    if not digits.isdigit():
+        raise SystemExit(f"Cannot adjust phone number {number}")
+    bumped = str(int(digits) + 1).zfill(len(digits))
+    return f"+{bumped}" if raw.startswith("+") else bumped
+
+
+def anosim_credentials() -> tuple[str, str]:
+    email = os.environ.get("ANOSIM_EMAIL", "").strip()
+    password = os.environ.get("ANOSIM_PASSWORD", "").strip()
+    if not email or not password:
+        raise SystemExit(f"Set ANOSIM_EMAIL and ANOSIM_PASSWORD in {ENV_FILE}")
+    return email, password
+
+
+def split_phone(number: str) -> tuple[str, str]:
+    digits = number.strip().lstrip("+")
+    for code in ("49", "43", "41"):
+        if digits.startswith(code) and len(digits) > len(code):
+            return f"+{code}", digits[len(code) :]
+    raise SystemExit(f"Unsupported phone number {number}")
+
+
+def open_tab(cdp: Cdp, port: int, url: str) -> tuple[Cdp, CdpSocket]:
+    created = cdp.call("Target.createTarget", {"url": url})
+    target_id = str(created.get("targetId") or "")
     deadline = time.time() + 20
-    while time.time() < deadline and not element_box(cdp, "#mobilePhone"):
+    while time.time() < deadline:
+        try:
+            targets = requests.get(f"http://127.0.0.1:{port}/json/list", timeout=5).json()
+        except (requests.RequestException, ValueError):
+            time.sleep(0.4)
+            continue
+        for item in targets:
+            if item.get("id") == target_id and item.get("webSocketDebuggerUrl"):
+                socket = CdpSocket(item["webSocketDebuggerUrl"])
+                return Cdp(socket), socket
         time.sleep(0.4)
-    if not element_box(cdp, "#mobilePhone"):
-        raise SystemExit("Phone form did not appear")
-    selected = select_option(cdp, "#mobilePhonePrefix", prefix)
-    if selected != prefix:
-        raise SystemExit(f"Could not select country code {prefix}")
-    type_into(cdp, "#mobilePhone", phone)
-    print(f"Filled {prefix} {phone}")
+    raise SystemExit("Could not open the Anosim tab")
+
+
+def login_anosim(cdp: Cdp) -> None:
+    email, password = anosim_credentials()
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        try:
+            if element_box(cdp, "#Input_Email"):
+                break
+            href = str(evaluate(cdp, "location.href") or "")
+        except (RuntimeError, TimeoutError):
+            time.sleep(0.4)
+            continue
+        if href.startswith("http") and "login" not in href.lower():
+            print("Anosim session already signed in")
+            return
+        time.sleep(0.4)
+    if not element_box(cdp, "#Input_Email"):
+        raise SystemExit("Anosim login form did not appear")
+    type_into(cdp, "#Input_Email", email)
+    type_into(cdp, "#Input_Password", password)
+    if not click_selector(cdp, "#login-submit"):
+        raise SystemExit("Could not find the Anosim login button")
+    print("Logged in to Anosim")
+    until = time.time() + 20
+    while time.time() < until:
+        try:
+            href = str(evaluate(cdp, "location.href") or "")
+        except (RuntimeError, TimeoutError):
+            time.sleep(0.4)
+            continue
+        if href and "login" not in href.lower():
+            return
+        time.sleep(0.4)
+    raise SystemExit("Anosim login did not finish")
+
+
+def free_numbers(cdp: Cdp) -> list[dict]:
+    navigate(cdp, ANOSIM_NUMBERS)
+    deadline = time.time() + 20
+    raw = None
+    while time.time() < deadline:
+        raw = evaluate(
+            cdp,
+            "(() => [...document.querySelectorAll('a.js-free-number')].filter((link) => !link.classList.contains('opacity-50')).map((link) => ({number: link.dataset.number || '', href: link.getAttribute('href') || ''})).filter((item) => item.number && item.href))()",
+        )
+        if isinstance(raw, list) and raw:
+            break
+        time.sleep(0.5)
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def pick_free_number(cdp: Cdp) -> dict:
+    usage = load_usage()
+    available = [
+        item for item in free_numbers(cdp)
+        if usage.get(str(item.get("number")), 0) < MAX_FREE_NUMBER_USES
+    ]
+    if not available:
+        raise SystemExit("No enabled German free numbers are left under the 20-use limit")
+    available.sort(key=lambda item: usage.get(str(item.get("number")), 0))
+    chosen = available[0]
+    number = str(chosen["number"])
+    print(f"Using {number} ({usage.get(number, 0)}/{MAX_FREE_NUMBER_USES} uses)")
+    return chosen
+
+
+def number_url(item: dict) -> str:
+    href = str(item.get("href") or "")
+    if href.startswith("/"):
+        return "https://anosim.net" + href
+    return href
+
+
+def first_message_text(cdp: Cdp) -> str:
+    text = evaluate(
+        cdp,
+        "(() => { const item = document.querySelector('.message-item'); return item ? (item.innerText || '').trim() : ''; })()",
+    )
+    return str(text or "")
+
+
+def code_from_message(text: str) -> str:
+    if "GMX" not in text.upper():
+        return ""
+    match = re.search(r"\b(\d{6})\b", text)
+    return match.group(1) if match else ""
+
+
+def open_number_page(cdp: Cdp, item: dict) -> str:
+    number = str(item.get("number") or "")
+    navigate(cdp, ANOSIM_NUMBERS)
+    selector = f"a.js-free-number[data-number={json.dumps(number)}]"
+    if not click_selector(cdp, selector):
+        navigate(cdp, number_url(item))
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            if element_box(cdp, "button.js-refresh"):
+                break
+        except (RuntimeError, TimeoutError):
+            pass
+        time.sleep(0.4)
+    try:
+        return first_message_text(cdp)
+    except (RuntimeError, TimeoutError):
+        return ""
+
+
+def fetch_sms_code(cdp: Cdp, item: dict, previous: str, test_mode: bool = False) -> str:
+    try:
+        path = str(evaluate(cdp, "location.pathname") or "")
+    except (RuntimeError, TimeoutError):
+        path = ""
+    if "/freenumbers/germany/" not in path or path.rstrip("/").endswith("/germany"):
+        open_number_page(cdp, item)
+    attempts = 1 if test_mode else 10
+    for _attempt in range(attempts):
+        if not click_selector(cdp, "button.js-refresh"):
+            open_number_page(cdp, item)
+            click_selector(cdp, "button.js-refresh")
+        print("Refreshed Anosim messages")
+        time.sleep(random.uniform(2, 3))
+        try:
+            text = first_message_text(cdp)
+        except (RuntimeError, TimeoutError):
+            text = ""
+        if not text and test_mode:
+            text = previous
+        if not text or (text == previous and not test_mode):
+            continue
+        code = code_from_message(text) or (code_from_message(previous) if test_mode else "")
+        if code:
+            print(f"SMS code {code}")
+            return code
+    raise SystemExit("GMX SMS code did not appear")
+
+
+def enter_confirmation_code(cdp: Cdp, code: str) -> None:
+    deadline = time.time() + 25
+    while time.time() < deadline and not element_box(cdp, "[name='confirmationCode.0.digit']"):
+        time.sleep(0.4)
+    if not element_box(cdp, "[name='confirmationCode.0.digit']"):
+        raise SystemExit("Confirmation code form did not appear")
+    for index, digit in enumerate(code[:6]):
+        type_into(cdp, f"[name='confirmationCode.{index}.digit']", digit)
+    print("Entered confirmation code")
     if not click_selector(cdp, "button[aria-label='Weiter'][data-testid='next-button']"):
-        raise SystemExit("Could not find the phone Weiter button")
+        raise SystemExit("Could not find the confirmation Weiter button")
     print("Clicked Weiter")
+
+
+def verify_phone(gmx: Cdp, port: int) -> None:
+    anosim, anosim_socket = open_tab(gmx, port, ANOSIM_LOGIN)
+    try:
+        login_anosim(anosim)
+        chosen = pick_free_number(anosim)
+        source = str(chosen["number"])
+        previous_message = open_number_page(anosim, chosen)
+        test_mode = anosim_test_mode()
+        submit = bump_phone(source) if test_mode else source
+        if test_mode:
+            print(f"Test mode: GMX gets {submit}; SMS is read from {source}")
+        prefix, national = split_phone(submit)
+        deadline = time.time() + 25
+        while time.time() < deadline and not element_box(gmx, "#mobilePhone"):
+            time.sleep(0.4)
+        if not element_box(gmx, "#mobilePhone"):
+            raise SystemExit("Phone form did not appear")
+        selected = select_option(gmx, "#mobilePhonePrefix", prefix)
+        if selected != prefix:
+            raise SystemExit(f"Could not select country code {prefix}")
+        type_into(gmx, "#mobilePhone", national)
+        print(f"Filled {prefix} {national}")
+        if not click_selector(gmx, "button[aria-label='Weiter'][data-testid='next-button']"):
+            raise SystemExit("Could not find the phone Weiter button")
+        print("Clicked Weiter")
+        if test_mode:
+            print(f"Test mode leaves {source} unused")
+        else:
+            count = record_number_use(source)
+            print(f"{source} use count is now {count}")
+        pause = random.uniform(3, 4)
+        print(f"Waiting {pause:.1f}s for the SMS")
+        time.sleep(pause)
+        code = fetch_sms_code(anosim, chosen, previous_message, test_mode)
+        enter_confirmation_code(gmx, code)
+    finally:
+        anosim_socket.close()
 
 
 def fill_signup(
@@ -1042,8 +1298,7 @@ def fill_signup(
     street: str,
     country: str,
     password: str,
-    phone_prefix: str,
-    phone: str,
+    port: int,
 ) -> None:
     accept_cookies(cdp, timeout=3)
     deadline = time.time() + 30
@@ -1082,7 +1337,7 @@ def fill_signup(
     time.sleep(pause)
     fill_address(cdp, postal_code, city, street, country)
     fill_password(cdp, password)
-    fill_phone(cdp, phone_prefix, phone)
+    verify_phone(cdp, port)
 
 
 def ask(value: str | None, label: str) -> str:
@@ -1142,8 +1397,6 @@ def main() -> None:
     parser.add_argument("--street", help="Street and house number")
     parser.add_argument("--country", default="DE", help="Country code, for example DE")
     parser.add_argument("--password", help="Password for the new mailbox")
-    parser.add_argument("--phone-prefix", default="+49", help="Mobile prefix: +49, +43, or +41")
-    parser.add_argument("--phone", help="Mobile number without the country code")
     parser.add_argument("--url", default=TARGET_URL, help="Page to open (default: TARGET_URL from .env)")
     parser.add_argument(
         "--proxies",
@@ -1185,14 +1438,6 @@ def main() -> None:
     password = ask(args.password, "Password")
     if not password or len(password) > 100:
         raise SystemExit("Password must be 1 to 100 characters")
-    prefix_aliases = {"DE": "+49", "AT": "+43", "CH": "+41", "+49": "+49", "+43": "+43", "+41": "+41", "49": "+49", "43": "+43", "41": "+41"}
-    raw_prefix = ask(args.phone_prefix, "Country code").upper().replace(" ", "")
-    phone_prefix = prefix_aliases.get(raw_prefix)
-    if phone_prefix not in {"+49", "+43", "+41"}:
-        raise SystemExit("Country code must be +49, +43, or +41")
-    phone = "".join(ch for ch in ask(args.phone, "Mobilfunknummer") if ch.isdigit())
-    if not phone or len(phone) > 15:
-        raise SystemExit("Mobilfunknummer must be 1 to 15 digits")
     if not args.url:
         raise SystemExit(f"Set TARGET_URL in {ENV_FILE}")
 
@@ -1230,8 +1475,7 @@ def main() -> None:
             street,
             country,
             password,
-            phone_prefix,
-            phone,
+            port,
         )
     finally:
         ws.close()

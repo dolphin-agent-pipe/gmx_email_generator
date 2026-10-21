@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 dolphin/apikey.py
 proxies.txt
+freenumber_usage.json
