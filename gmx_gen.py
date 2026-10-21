@@ -1,4 +1,4 @@
-"""Create a Dolphin Anty profile named with the email you provide, open TARGET_URL from .env, click through to registration, and fill the signup form.
+"""Create a Dolphin Anty profile with the name you provide, open TARGET_URL from .env, click through to registration, and fill the signup form.
 
 A random proxy from proxies.txt is attached to that profile.
 Dolphin Anty must already be running and logged in on this machine.
@@ -36,7 +36,6 @@ ACCOUNTS_FILE = ROOT / "accounts.json"
 MAX_FREE_NUMBER_USES = 20
 ANOSIM_LOGIN = "https://anosim.net/login"
 ANOSIM_NUMBERS = "https://anosim.net/freenumbers/germany"
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def load_env(path: Path) -> None:
@@ -215,11 +214,11 @@ def align_platform(data: dict, fingerprint: dict) -> None:
         data["platformName"] = "Linux x86_64"
 
 
-def normalize_email(value: str) -> str:
-    email = value.strip()
-    if not EMAIL_RE.fullmatch(email):
-        raise SystemExit(f"Provide a real email to use as the Dolphin profile name: {value!r}")
-    return email
+def normalize_profile_name(value: str) -> str:
+    name = " ".join(value.split())
+    if not name or len(name) > 80:
+        raise SystemExit("Profile name must be 1 to 80 characters")
+    return name
 
 
 def apply_hardware(data: dict, cores: int, memory_gb: int) -> None:
@@ -1292,16 +1291,22 @@ def free_numbers(cdp: Cdp) -> list[dict]:
     return [item for item in raw if isinstance(item, dict)]
 
 
-def pick_free_number(cdp: Cdp) -> dict:
+class NoPhonesLeft(Exception):
+    pass
+
+
+def pick_free_number(cdp: Cdp, skip: set[str] | None = None) -> dict:
     usage, banned = load_store()
     banned_numbers = set(banned)
+    skipped = skip or set()
     available = [
         item for item in free_numbers(cdp)
         if str(item.get("number")) not in banned_numbers
+        and str(item.get("number")) not in skipped
         and usage.get(str(item.get("number")), 0) < MAX_FREE_NUMBER_USES
     ]
     if not available:
-        raise SystemExit("No enabled German free numbers are left. Each remaining number is banned or already used 20 times.")
+        raise NoPhonesLeft("No enabled German free numbers are left. Each remaining number is banned, already used 20 times, or failed to receive a GMX SMS.")
     available.sort(key=lambda item: usage.get(str(item.get("number")), 0))
     chosen = available[0]
     number = str(chosen["number"])
@@ -1335,11 +1340,11 @@ def first_message_text(cdp: Cdp) -> str:
 
 
 def code_from_message(text: str) -> str:
-    labeled = re.search(r"(?:lautet|code)\s*[:：]?\s*(\d{4,8})", text, re.IGNORECASE)
-    if labeled and ("GMX" in text.upper() or "identit" in text.lower() or "code" in text.lower()):
-        return labeled.group(1)
-    if "GMX" not in text.upper():
+    if "GMX" not in text.upper() and "identit" not in text.lower():
         return ""
+    labeled = re.search(r"(?:lautet|code)\s*[:：]?\s*(\d{4,8})", text, re.IGNORECASE)
+    if labeled:
+        return labeled.group(1)
     match = re.search(r"\b(\d{6})\b", text)
     return match.group(1) if match else ""
 
@@ -1411,10 +1416,10 @@ def fetch_sms_code(
     previous: str,
     test_mode: bool = False,
     require_new: bool = False,
-) -> tuple[str, str]:
+    attempts: int = 1,
+) -> tuple[str, str] | None:
     number = str(item.get("number") or "")
     open_number_page(cdp, item)
-    attempts = 4 if test_mode and not require_new else 6
     for _attempt in range(attempts):
         if not click_refresh(cdp, number):
             open_number_page(cdp, item)
@@ -1445,7 +1450,7 @@ def fetch_sms_code(
             return code, matched or text
         preview = " | ".join(message[:80] for message in messages[:3])
         print(f"No GMX code in the inbox yet: {preview}")
-    raise SystemExit("GMX SMS code did not appear")
+    return None
 
 
 def page_url(cdp: Cdp) -> str:
@@ -1552,8 +1557,9 @@ def verify_phone(gmx: Cdp, port: int) -> None:
     try:
         login_anosim(anosim)
         test_mode = anosim_test_mode()
+        skipped: set[str] = set()
         while True:
-            chosen = pick_free_number(anosim)
+            chosen = pick_free_number(anosim, skipped)
             source = str(chosen["number"])
             previous_message = open_number_page(anosim, chosen)
             submit = bump_phone(source) if test_mode else source
@@ -1588,8 +1594,12 @@ def verify_phone(gmx: Cdp, port: int) -> None:
             time.sleep(pause)
             message = previous_message
             switch_number = False
-            for attempt in range(4):
-                code, message = fetch_sms_code(anosim, chosen, message, test_mode, require_new=attempt > 0)
+            for attempt in range(3):
+                fetched = fetch_sms_code(anosim, chosen, message, test_mode, require_new=attempt > 0, attempts=1)
+                if fetched is None:
+                    print(f"No GMX SMS for {source} on try {attempt + 1} of 3")
+                    continue
+                code, message = fetched
                 result = submit_confirmation_code(gmx, code)
                 if result == "banned":
                     print(f"{source} opened https://hilfe.gmx.net/kundenservice/flexreg.html")
@@ -1602,9 +1612,12 @@ def verify_phone(gmx: Cdp, port: int) -> None:
                 if result == "closed":
                     print("Confirmation step closed")
                     return
-                print("Refreshing Anosim for a new code")
+                print("Confirmation code was rejected")
             else:
-                raise SystemExit("Confirmation code was rejected")
+                print(f"No working GMX SMS for {source} after 3 tries")
+                skipped.add(source)
+                return_to_phone_form(gmx)
+                continue
             if switch_number:
                 continue
     finally:
@@ -1711,9 +1724,9 @@ def resolve_proxy_type(session: requests.Session, proxy: dict, proxy_type: str, 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Create a Dolphin profile named with your email, open TARGET_URL, and submit the signup form."
+        description="Create a Dolphin profile, open TARGET_URL, and submit the signup form."
     )
-    parser.add_argument("email", nargs="?", help="Email used as the Dolphin profile name")
+    parser.add_argument("email", nargs="?", help="Name for the Dolphin profile")
     parser.add_argument("--first-name", help="First name for the signup form")
     parser.add_argument("--last-name", help="Last name for the signup form")
     parser.add_argument("--day", help="Birth day")
@@ -1736,10 +1749,10 @@ def main() -> None:
     args = parser.parse_args()
     if not args.email:
         if sys.stdin.isatty():
-            args.email = input("Email for the Dolphin profile name: ")
+            args.email = input("Dolphin profile name: ")
         if not args.email:
-            raise SystemExit("Pass the profile email: python open_xxx.py user@example.com")
-    email = normalize_email(args.email)
+            raise SystemExit("Pass the profile name: python gmx_gen.py lena-hoffmann")
+    email = normalize_profile_name(args.email)
     first_name = normalize_name(ask(args.first_name, "First name"), "First name")
     last_name = normalize_name(ask(args.last_name, "Last name"), "Last name")
     day, month, year = normalize_birth(
@@ -1809,6 +1822,10 @@ def main() -> None:
             password,
             port,
         )
+    except NoPhonesLeft as exc:
+        print(exc)
+        finish_profile(session, api, profile_id, cdp, ws)
+        raise SystemExit(str(exc)) from exc
     except BaseException:
         if ws is not None:
             try:
