@@ -32,6 +32,7 @@ from dolphin.apikey import api_key
 
 ENV_FILE = ROOT / ".env"
 USAGE_FILE = ROOT / "freenumber_usage.json"
+ACCOUNTS_FILE = ROOT / "accounts.json"
 MAX_FREE_NUMBER_USES = 20
 ANOSIM_LOGIN = "https://anosim.net/login"
 ANOSIM_NUMBERS = "https://anosim.net/freenumbers/germany"
@@ -244,6 +245,9 @@ def build_profile(api: DolphinAPI, name: str, proxy: dict, proxy_type: str) -> d
             align_platform(data, fingerprint)
             apply_hardware(data, 8, 8)
             data["proxy"] = proxy_body(proxy, proxy_type)
+            launch_args = data.setdefault("args", [])
+            if "--start-maximized" not in launch_args:
+                launch_args.append("--start-maximized")
             return data
         except Exception as exc:
             errors.append(f"chrome {version}: {exc}")
@@ -283,6 +287,22 @@ def create_profile(api: DolphinAPI, email: str, proxy: dict, proxy_type: str) ->
     return profile_id
 
 
+def maximize_window(cdp: Cdp, target_id: str = "") -> None:
+    params = {"targetId": target_id} if target_id else {}
+    try:
+        info = cdp.call("Browser.getWindowForTarget", params)
+        window_id = info.get("windowId")
+        if window_id is None:
+            return
+        cdp.call(
+            "Browser.setWindowBounds",
+            {"windowId": window_id, "bounds": {"windowState": "maximized"}},
+        )
+        print("Opened the browser at full width")
+    except (RuntimeError, TimeoutError, OSError) as exc:
+        print(f"Could not maximize the browser: {exc}")
+
+
 def start_profile(session: requests.Session, profile_id: str, headless: bool) -> dict:
     query = "automation=1"
     if headless:
@@ -312,6 +332,47 @@ def start_profile(session: requests.Session, profile_id: str, headless: bool) ->
             continue
         time.sleep(2 + attempt)
     raise SystemExit(f"Could not start Dolphin profile {profile_id}: {last_error}")
+
+
+def stop_profile(session: requests.Session, profile_id: str) -> None:
+    try:
+        response = session.get(f"{LOCAL_API}/v1.0/browser_profiles/{profile_id}/stop", timeout=60)
+    except requests.RequestException as exc:
+        print(f"Could not close Dolphin profile {profile_id}: {exc}")
+        return
+    if response.ok:
+        print(f"Closed Dolphin profile {profile_id}")
+        return
+    print(f"Could not close Dolphin profile {profile_id}: HTTP {response.status_code}")
+
+
+def remove_profile(api: DolphinAPI, profile_id: str) -> None:
+    last_error: Exception | None = None
+    for _attempt in range(3):
+        try:
+            api.delete_profile(profile_id)
+            print(f"Removed Dolphin profile {profile_id}")
+            return
+        except RuntimeError as exc:
+            last_error = exc
+            time.sleep(2)
+    print(f"Could not remove Dolphin profile {profile_id}: {last_error}")
+
+
+def finish_profile(session: requests.Session, api: DolphinAPI, profile_id: str, cdp: Cdp | None, ws: CdpSocket | None) -> None:
+    if cdp is not None:
+        try:
+            cdp.call("Browser.close", timeout=10)
+        except (RuntimeError, TimeoutError, OSError):
+            pass
+    if ws is not None:
+        try:
+            ws.close()
+        except OSError:
+            pass
+    stop_profile(session, profile_id)
+    time.sleep(1)
+    remove_profile(api, profile_id)
 
 
 class CdpSocket:
@@ -660,16 +721,39 @@ def find_labeled(cdp: Cdp, selector: str, label: str) -> dict | None:
     return box if isinstance(box, dict) else None
 
 
-def click_labeled(cdp: Cdp, selector: str, label: str, timeout: float = 30) -> None:
+def click_labeled(cdp: Cdp, selector: str, label: str, timeout: float = 30, required: bool = True) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        box = find_labeled(cdp, selector, label)
+        try:
+            box = find_labeled(cdp, selector, label)
+        except (RuntimeError, TimeoutError):
+            box = None
         if box:
             mouse_click(cdp, box["x"], box["y"])
             print(f"Clicked {label}")
-            return
+            return True
         time.sleep(0.4)
-    raise SystemExit(f"Could not find {label}")
+    if required:
+        raise SystemExit(f"Could not find {label}")
+    return False
+
+
+def reload_page(cdp: Cdp) -> None:
+    print("Refreshing the page")
+    cdp.call("Page.enable")
+    cdp.call("Page.reload", {"ignoreCache": True}, timeout=45)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            state = str(evaluate(cdp, "document.readyState + '\\n' + location.href") or "")
+        except (RuntimeError, TimeoutError):
+            time.sleep(0.5)
+            continue
+        ready, _, href = state.partition("\n")
+        if ready == "complete" and href and not href.startswith("about:"):
+            print(f"Opened {href}")
+            return
+        time.sleep(0.5)
 
 
 ACCEPT_SELECTOR = "#save-all-pur, button[data-id='accept-button'], button[aria-label='Akzeptieren und weiter']"
@@ -823,8 +907,14 @@ def wait_for_text(cdp: Cdp, label: str, timeout: float = 30) -> bool:
 
 
 def open_registration(cdp: Cdp) -> None:
-    accept_cookies(cdp, timeout=20)
-    click_labeled(cdp, "a[data-testid='register_button'], button.account-avatar__button, a, button", "Registrieren")
+    register_selector = "a[data-testid='register_button'], button.account-avatar__button, a, button"
+    for attempt in range(3):
+        accept_cookies(cdp, timeout=20)
+        if click_labeled(cdp, register_selector, "Registrieren", timeout=15, required=False):
+            break
+        if attempt == 2:
+            raise SystemExit("Could not find Registrieren")
+        reload_page(cdp)
     if not wait_for_text(cdp, "Jetzt registrieren", timeout=15):
         print("Jetzt registrieren did not appear")
         click_labeled(cdp, "a[data-testid='register_button']", "Registrieren")
@@ -888,32 +978,64 @@ def tweak_email(value: str) -> str:
     return local + (separator + domain if separator else "")
 
 
-def choose_email(cdp: Cdp, fallback_email: str) -> None:
+def visible_mailbox(cdp: Cdp, fallback: str) -> str:
+    try:
+        found = evaluate(
+            cdp,
+            "(() => {"
+            " const text = document.body ? document.body.innerText : '';"
+            " const match = text.match(/[A-Za-z0-9._%+-]+@gmx\\.[A-Za-z.]+/);"
+            " return match ? match[0] : '';"
+            "})()",
+        )
+    except (RuntimeError, TimeoutError):
+        found = ""
+    mailbox = str(found or "").strip()
+    return mailbox or fallback
+
+
+def save_account(email: str, password: str) -> None:
+    accounts: list[dict[str, str]] = []
+    if ACCOUNTS_FILE.is_file():
+        try:
+            raw = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = []
+        if isinstance(raw, dict):
+            raw = [raw]
+        if isinstance(raw, list):
+            accounts = [item for item in raw if isinstance(item, dict)]
+    accounts.append({"email": email, "password": password})
+    ACCOUNTS_FILE.write_text(json.dumps(accounts, indent=2), encoding="utf-8")
+    print(f"Saved {email} to {ACCOUNTS_FILE.name}")
+
+
+def choose_email(cdp: Cdp, fallback_email: str) -> str:
     deadline = time.time() + 25
     attempts = 0
     while time.time() < deadline:
         if element_box(cdp, "#postalCode"):
             print("Address form is already open")
-            return
+            return visible_mailbox(cdp, fallback_email)
         state = weiter_state(cdp)
         if state.get("found") and not state.get("disabled") and not state.get("taken"):
             if not click_selector(cdp, "button[aria-label='Weiter'][data-testid='next-button']"):
                 raise SystemExit("Could not find the Weiter button")
             print("Clicked Weiter")
-            return
+            return visible_mailbox(cdp, fallback_email)
         selector = email_selector(cdp)
         needs_change = bool(selector) and (state.get("taken") or (state.get("found") and state.get("disabled")))
         if needs_change and not state.get("taken"):
             time.sleep(3)
             if element_box(cdp, "#postalCode"):
                 print("Address form is already open")
-                return
+                return visible_mailbox(cdp, fallback_email)
             state = weiter_state(cdp)
             if state.get("found") and not state.get("disabled") and not state.get("taken"):
                 if not click_selector(cdp, "button[aria-label='Weiter'][data-testid='next-button']"):
                     raise SystemExit("Could not find the Weiter button")
                 print("Clicked Weiter")
-                return
+                return visible_mailbox(cdp, fallback_email)
             needs_change = bool(email_selector(cdp)) and (state.get("taken") or (state.get("found") and state.get("disabled")))
             selector = email_selector(cdp)
         if needs_change:
@@ -928,7 +1050,7 @@ def choose_email(cdp: Cdp, fallback_email: str) -> None:
                 time.sleep(1)
                 if element_box(cdp, "#postalCode"):
                     print("Address form is already open")
-                    return
+                    return visible_mailbox(cdp, updated if "@" in updated else fallback_email)
                 raise
             print(f"Email updated to {updated}")
             time.sleep(1.5)
@@ -1017,34 +1139,58 @@ def select_option(cdp: Cdp, selector: str, value: str) -> str:
     return str(selected or "")
 
 
-def load_usage() -> dict[str, int]:
+def load_store() -> tuple[dict[str, int], list[str]]:
     if not USAGE_FILE.is_file():
-        return {}
+        return {}, []
     try:
         raw = json.loads(USAGE_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {}
+        return {}, []
     if not isinstance(raw, dict):
-        return {}
+        return {}, []
     usage: dict[str, int] = {}
     for key, value in raw.items():
+        if key == "banned":
+            continue
         try:
             usage[str(key)] = int(value)
         except (TypeError, ValueError):
             continue
+    banned_raw = raw.get("banned")
+    banned = [str(number) for number in banned_raw] if isinstance(banned_raw, list) else []
+    return usage, banned
+
+
+def save_store(usage: dict[str, int], banned: list[str]) -> None:
+    payload: dict[str, int | list[str]] = dict(usage)
+    payload["banned"] = banned
+    USAGE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_usage() -> dict[str, int]:
+    usage, _banned = load_store()
     return usage
 
 
 def save_usage(usage: dict[str, int]) -> None:
-    USAGE_FILE.write_text(json.dumps(usage, indent=2), encoding="utf-8")
+    _usage, banned = load_store()
+    save_store(usage, banned)
 
 
 def record_number_use(number: str) -> int:
-    usage = load_usage()
+    usage, banned = load_store()
     count = usage.get(number, 0) + 1
     usage[number] = count
-    save_usage(usage)
+    save_store(usage, banned)
     return count
+
+
+def ban_number(number: str) -> None:
+    usage, banned = load_store()
+    if number not in banned:
+        banned.append(number)
+    save_store(usage, banned)
+    print(f"Banned {number}")
 
 
 def anosim_test_mode() -> bool:
@@ -1147,13 +1293,15 @@ def free_numbers(cdp: Cdp) -> list[dict]:
 
 
 def pick_free_number(cdp: Cdp) -> dict:
-    usage = load_usage()
+    usage, banned = load_store()
+    banned_numbers = set(banned)
     available = [
         item for item in free_numbers(cdp)
-        if usage.get(str(item.get("number")), 0) < MAX_FREE_NUMBER_USES
+        if str(item.get("number")) not in banned_numbers
+        and usage.get(str(item.get("number")), 0) < MAX_FREE_NUMBER_USES
     ]
     if not available:
-        raise SystemExit("No enabled German free numbers are left under the 20-use limit")
+        raise SystemExit("No enabled German free numbers are left. Each remaining number is banned or already used 20 times.")
     available.sort(key=lambda item: usage.get(str(item.get("number")), 0))
     chosen = available[0]
     number = str(chosen["number"])
@@ -1168,119 +1316,297 @@ def number_url(item: dict) -> str:
     return href
 
 
-def first_message_text(cdp: Cdp) -> str:
-    text = evaluate(
+def inbox_messages(cdp: Cdp) -> list[str]:
+    raw = evaluate(
         cdp,
-        "(() => { const item = document.querySelector('.message-item'); return item ? (item.innerText || '').trim() : ''; })()",
+        "(() => {"
+        " const nodes = [...document.querySelectorAll('.message-item, .free-numbers-list-group-messages .list-group-item')];"
+        " return nodes.map((item) => (item.innerText || item.textContent || '').replace(/\\s+/g, ' ').trim()).filter(Boolean);"
+        "})()",
     )
-    return str(text or "")
+    if not isinstance(raw, list):
+        return []
+    return [str(item) for item in raw if str(item).strip()]
+
+
+def first_message_text(cdp: Cdp) -> str:
+    messages = inbox_messages(cdp)
+    return messages[0] if messages else ""
 
 
 def code_from_message(text: str) -> str:
+    labeled = re.search(r"(?:lautet|code)\s*[:：]?\s*(\d{4,8})", text, re.IGNORECASE)
+    if labeled and ("GMX" in text.upper() or "identit" in text.lower() or "code" in text.lower()):
+        return labeled.group(1)
     if "GMX" not in text.upper():
         return ""
     match = re.search(r"\b(\d{6})\b", text)
     return match.group(1) if match else ""
 
 
+def code_from_inbox(messages: list[str]) -> tuple[str, str]:
+    for text in messages:
+        code = code_from_message(text)
+        if code:
+            return code, text
+    return "", messages[0] if messages else ""
+
+
+def click_refresh(cdp: Cdp, number: str) -> bool:
+    selectors = [
+        f"button.js-refresh[data-number={json.dumps(number)}]",
+        f"button.js-refresh[data-number={json.dumps(number.lstrip('+'))}]",
+        "button.js-refresh",
+    ]
+    for selector in selectors:
+        if click_selector(cdp, selector):
+            return True
+    clicked = evaluate(
+        cdp,
+        "(() => {"
+        f" const wanted = [{json.dumps(number)}, {json.dumps(number.lstrip('+'))}];"
+        " const buttons = [...document.querySelectorAll('button.js-refresh')];"
+        " const button = buttons.find((el) => wanted.includes(el.dataset.number || '')) || buttons[0];"
+        " if (!button) return false;"
+        " button.click();"
+        " return true;"
+        "})()",
+    )
+    return bool(clicked)
+
+
 def open_number_page(cdp: Cdp, item: dict) -> str:
     number = str(item.get("number") or "")
-    navigate(cdp, ANOSIM_NUMBERS)
-    selector = f"a.js-free-number[data-number={json.dumps(number)}]"
-    if not click_selector(cdp, selector):
-        navigate(cdp, number_url(item))
-    deadline = time.time() + 15
+    navigate(cdp, number_url(item))
+    deadline = time.time() + 12
     while time.time() < deadline:
         try:
-            if element_box(cdp, "button.js-refresh"):
+            if inbox_messages(cdp) or element_box(cdp, "button.js-refresh"):
                 break
         except (RuntimeError, TimeoutError):
             pass
         time.sleep(0.4)
+    if not inbox_messages(cdp):
+        navigate(cdp, ANOSIM_NUMBERS)
+        selector = f"a.js-free-number[data-number={json.dumps(number)}]"
+        if not click_selector(cdp, selector):
+            navigate(cdp, number_url(item))
+        deadline = time.time() + 12
+        while time.time() < deadline:
+            try:
+                if inbox_messages(cdp) or element_box(cdp, "button.js-refresh"):
+                    break
+            except (RuntimeError, TimeoutError):
+                pass
+            time.sleep(0.4)
     try:
         return first_message_text(cdp)
     except (RuntimeError, TimeoutError):
         return ""
 
 
-def fetch_sms_code(cdp: Cdp, item: dict, previous: str, test_mode: bool = False) -> str:
-    try:
-        path = str(evaluate(cdp, "location.pathname") or "")
-    except (RuntimeError, TimeoutError):
-        path = ""
-    if "/freenumbers/germany/" not in path or path.rstrip("/").endswith("/germany"):
-        open_number_page(cdp, item)
-    attempts = 1 if test_mode else 10
+def fetch_sms_code(
+    cdp: Cdp,
+    item: dict,
+    previous: str,
+    test_mode: bool = False,
+    require_new: bool = False,
+) -> tuple[str, str]:
+    number = str(item.get("number") or "")
+    open_number_page(cdp, item)
+    attempts = 4 if test_mode and not require_new else 6
     for _attempt in range(attempts):
-        if not click_selector(cdp, "button.js-refresh"):
+        if not click_refresh(cdp, number):
             open_number_page(cdp, item)
-            click_selector(cdp, "button.js-refresh")
+            if not click_refresh(cdp, number):
+                print("Could not click the Anosim refresh button")
+                continue
         print("Refreshed Anosim messages")
-        time.sleep(random.uniform(2, 3))
+        pause = random.uniform(10, 15)
+        print(f"Waiting {pause:.1f}s for the refreshed inbox")
+        time.sleep(pause)
         try:
-            text = first_message_text(cdp)
+            messages = inbox_messages(cdp)
         except (RuntimeError, TimeoutError):
-            text = ""
-        if not text and test_mode:
-            text = previous
-        if not text or (text == previous and not test_mode):
+            messages = []
+        if not messages and test_mode and not require_new and previous:
+            messages = [previous]
+        text = messages[0] if messages else ""
+        if not text or (text == previous and (not test_mode or require_new)):
+            preview = text[:160] if text else "empty inbox"
+            print(f"No new GMX message yet: {preview}")
             continue
-        code = code_from_message(text) or (code_from_message(previous) if test_mode else "")
+        code, matched = code_from_inbox(messages)
+        if not code and test_mode and not require_new:
+            code = code_from_message(previous)
+            matched = previous
         if code:
             print(f"SMS code {code}")
-            return code
+            return code, matched or text
+        preview = " | ".join(message[:80] for message in messages[:3])
+        print(f"No GMX code in the inbox yet: {preview}")
     raise SystemExit("GMX SMS code did not appear")
 
 
-def enter_confirmation_code(cdp: Cdp, code: str) -> None:
-    deadline = time.time() + 25
-    while time.time() < deadline and not element_box(cdp, "[name='confirmationCode.0.digit']"):
+def page_url(cdp: Cdp) -> str:
+    try:
+        return str(evaluate(cdp, "location.href") or "")
+    except (RuntimeError, TimeoutError):
+        return ""
+
+
+def registration_failed(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    return parsed.netloc == "hilfe.gmx.net" and parsed.path.rstrip("/").endswith("flexreg.html")
+
+
+def go_back(cdp: Cdp) -> None:
+    try:
+        cdp.call("Page.enable")
+        history = cdp.call("Page.getNavigationHistory")
+        index = int(history.get("currentIndex") or 0)
+        entries = history.get("entries") or []
+        if index > 0 and isinstance(entries[index - 1], dict):
+            cdp.call("Page.navigateToHistoryEntry", {"entryId": entries[index - 1].get("id")})
+            print("Moved back to the previous page")
+            return
+    except (RuntimeError, TimeoutError, TypeError, ValueError, IndexError) as exc:
+        print(f"Could not use navigation history: {exc}")
+    try:
+        evaluate(cdp, "history.back()")
+    except (RuntimeError, TimeoutError) as exc:
+        raise SystemExit(f"Could not move back to the phone form: {exc}") from exc
+    print("Moved back to the previous page")
+
+
+def phone_form_ready(cdp: Cdp) -> bool:
+    if registration_failed(page_url(cdp)):
+        return False
+    try:
+        return bool(element_box(cdp, "#mobilePhone"))
+    except (RuntimeError, TimeoutError):
+        return False
+
+
+def return_to_phone_form(cdp: Cdp) -> None:
+    for _step in range(3):
+        if phone_form_ready(cdp):
+            return
+        go_back(cdp)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if phone_form_ready(cdp):
+                return
+            time.sleep(0.4)
+    raise SystemExit("Phone form did not return after the rejected number")
+
+
+def phone_number_rejected(cdp: Cdp, timeout: float = 8) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if registration_failed(page_url(cdp)):
+            return True
+        try:
+            if element_box(cdp, "[name='confirmationCode.0.digit']"):
+                return False
+        except (RuntimeError, TimeoutError):
+            pass
         time.sleep(0.4)
-    if not element_box(cdp, "[name='confirmationCode.0.digit']"):
-        raise SystemExit("Confirmation code form did not appear")
-    for index, digit in enumerate(code[:6]):
-        type_into(cdp, f"[name='confirmationCode.{index}.digit']", digit)
+    return registration_failed(page_url(cdp))
+
+
+def submit_confirmation_code(cdp: Cdp, code: str) -> str:
+    digit = "[name='confirmationCode.0.digit']"
+    consent = "button[aria-label='Zustimmen und weiter'][data-testid='next-button']"
+    deadline = time.time() + 25
+    while time.time() < deadline and not element_box(cdp, digit):
+        time.sleep(0.4)
+    if not element_box(cdp, digit):
+        return "closed"
+    for index, character in enumerate(code[:6]):
+        type_into(cdp, f"[name='confirmationCode.{index}.digit']", character)
     print("Entered confirmation code")
     if not click_selector(cdp, "button[aria-label='Weiter'][data-testid='next-button']"):
         raise SystemExit("Could not find the confirmation Weiter button")
     print("Clicked Weiter")
+    print("Waiting 2s before Zustimmen und weiter")
+    time.sleep(2)
+    if registration_failed(page_url(cdp)):
+        return "banned"
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        if registration_failed(page_url(cdp)):
+            return "banned"
+        if element_box(cdp, consent) and click_selector(cdp, consent):
+            print("Clicked Zustimmen und weiter")
+            return "accepted"
+        time.sleep(0.4)
+    if element_box(cdp, digit):
+        print("Confirmation code was rejected")
+        return "rejected"
+    return "closed"
 
 
 def verify_phone(gmx: Cdp, port: int) -> None:
     anosim, anosim_socket = open_tab(gmx, port, ANOSIM_LOGIN)
     try:
         login_anosim(anosim)
-        chosen = pick_free_number(anosim)
-        source = str(chosen["number"])
-        previous_message = open_number_page(anosim, chosen)
         test_mode = anosim_test_mode()
-        submit = bump_phone(source) if test_mode else source
-        if test_mode:
-            print(f"Test mode: GMX gets {submit}; SMS is read from {source}")
-        prefix, national = split_phone(submit)
-        deadline = time.time() + 25
-        while time.time() < deadline and not element_box(gmx, "#mobilePhone"):
-            time.sleep(0.4)
-        if not element_box(gmx, "#mobilePhone"):
-            raise SystemExit("Phone form did not appear")
-        selected = select_option(gmx, "#mobilePhonePrefix", prefix)
-        if selected != prefix:
-            raise SystemExit(f"Could not select country code {prefix}")
-        type_into(gmx, "#mobilePhone", national)
-        print(f"Filled {prefix} {national}")
-        if not click_selector(gmx, "button[aria-label='Weiter'][data-testid='next-button']"):
-            raise SystemExit("Could not find the phone Weiter button")
-        print("Clicked Weiter")
-        if test_mode:
-            print(f"Test mode leaves {source} unused")
-        else:
-            count = record_number_use(source)
-            print(f"{source} use count is now {count}")
-        pause = random.uniform(3, 4)
-        print(f"Waiting {pause:.1f}s for the SMS")
-        time.sleep(pause)
-        code = fetch_sms_code(anosim, chosen, previous_message, test_mode)
-        enter_confirmation_code(gmx, code)
+        while True:
+            chosen = pick_free_number(anosim)
+            source = str(chosen["number"])
+            previous_message = open_number_page(anosim, chosen)
+            submit = bump_phone(source) if test_mode else source
+            if test_mode:
+                print(f"Test mode: GMX gets {submit}; SMS is read from {source}")
+            prefix, national = split_phone(submit)
+            deadline = time.time() + 25
+            while time.time() < deadline and not element_box(gmx, "#mobilePhone"):
+                time.sleep(0.4)
+            if not element_box(gmx, "#mobilePhone"):
+                raise SystemExit("Phone form did not appear")
+            selected = select_option(gmx, "#mobilePhonePrefix", prefix)
+            if selected != prefix:
+                raise SystemExit(f"Could not select country code {prefix}")
+            type_into(gmx, "#mobilePhone", national)
+            print(f"Filled {prefix} {national}")
+            if not click_selector(gmx, "button[aria-label='Weiter'][data-testid='next-button']"):
+                raise SystemExit("Could not find the phone Weiter button")
+            print("Clicked Weiter")
+            if phone_number_rejected(gmx):
+                print(f"{source} opened https://hilfe.gmx.net/kundenservice/flexreg.html")
+                ban_number(source)
+                return_to_phone_form(gmx)
+                continue
+            if test_mode:
+                print(f"Test mode leaves {source} unused")
+            else:
+                count = record_number_use(source)
+                print(f"{source} use count is now {count}")
+            pause = random.uniform(3, 4)
+            print(f"Waiting {pause:.1f}s for the SMS")
+            time.sleep(pause)
+            message = previous_message
+            switch_number = False
+            for attempt in range(4):
+                code, message = fetch_sms_code(anosim, chosen, message, test_mode, require_new=attempt > 0)
+                result = submit_confirmation_code(gmx, code)
+                if result == "banned":
+                    print(f"{source} opened https://hilfe.gmx.net/kundenservice/flexreg.html")
+                    ban_number(source)
+                    return_to_phone_form(gmx)
+                    switch_number = True
+                    break
+                if result == "accepted":
+                    return
+                if result == "closed":
+                    print("Confirmation step closed")
+                    return
+                print("Refreshing Anosim for a new code")
+            else:
+                raise SystemExit("Confirmation code was rejected")
+            if switch_number:
+                continue
     finally:
         anosim_socket.close()
 
@@ -1299,7 +1625,7 @@ def fill_signup(
     country: str,
     password: str,
     port: int,
-) -> None:
+) -> str:
     accept_cookies(cdp, timeout=3)
     deadline = time.time() + 30
     while time.time() < deadline and not element_box(cdp, "#firstName"):
@@ -1331,13 +1657,14 @@ def fill_signup(
     if not click_selector(cdp, "button[data-testid='next-button']"):
         raise SystemExit("Could not find the Get started button")
     print("Clicked Get started")
-    choose_email(cdp, email)
+    mailbox = choose_email(cdp, email)
     pause = random.uniform(3, 4)
     print(f"Waiting {pause:.1f}s before the address form")
     time.sleep(pause)
     fill_address(cdp, postal_code, city, street, country)
     fill_password(cdp, password)
     verify_phone(cdp, port)
+    return visible_mailbox(cdp, mailbox)
 
 
 def ask(value: str | None, label: str) -> str:
@@ -1449,20 +1776,25 @@ def main() -> None:
 
     api = DolphinAPI(collect_garbage_on_init=False)
     profile_id = create_profile(api, email, proxy, proxy_type)
-    automation = start_profile(session, profile_id, args.headless)
-    port = int(automation["port"])
-    print(f"Started {email} on port {port}")
-    ws, target_id = connect_page(port)
+    ws: CdpSocket | None = None
+    cdp: Cdp | None = None
+    mailbox = email
     try:
+        automation = start_profile(session, profile_id, args.headless)
+        port = int(automation["port"])
+        print(f"Started {email} on port {port}")
+        ws, target_id = connect_page(port)
         cdp = Cdp(ws)
         if target_id:
             try:
                 cdp.call("Target.activateTarget", {"targetId": target_id})
             except (RuntimeError, TimeoutError) as exc:
                 print(f"Could not focus the tab: {exc}")
+        if not args.headless:
+            maximize_window(cdp, target_id)
         navigate(cdp, args.url)
         open_registration(cdp)
-        fill_signup(
+        mailbox = fill_signup(
             cdp,
             email,
             first_name,
@@ -1477,9 +1809,16 @@ def main() -> None:
             password,
             port,
         )
-    finally:
-        ws.close()
-    print("Browser left open.")
+    except BaseException:
+        if ws is not None:
+            try:
+                ws.close()
+            except OSError:
+                pass
+        print("Browser left open.")
+        raise
+    save_account(mailbox, password)
+    finish_profile(session, api, profile_id, cdp, ws)
 
 
 if __name__ == "__main__":
