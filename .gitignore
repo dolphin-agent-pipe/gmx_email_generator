@@ -5,3 +5,9 @@ proxies.txt
 freenumber_usage.json
 accounts.json
 .env
+sms_orders.json
+sms_orders.json.tmp
+sms_browser/
+kka_orders.json
+kka_orders.json.tmp
+kka_browser/
