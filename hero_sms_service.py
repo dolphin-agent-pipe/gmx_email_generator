@@ -7,9 +7,10 @@ Keeps one browser signed in and serves three calls:
     POST /code_passed   {"email": "name@gmx.net"}
 
 `type` is `gmx` or `webde`. Each get_started searches that service, chooses
-Germany, and buys HERO_SMS_ORDER_COUNT numbers (default 3, maximum 4). It always
-picks the cheapest price whose stock is above zero. Numbers are saved under
-that email in kka_orders.json. get_code waits up to 5 minutes for an OTP.
+Germany, and buys the cheapest price whose stock is above zero. It sets the
+order stepper to HERO_SMS_ORDER_COUNT (default 3, maximum 10) and clicks Buy
+once, so that one click orders every number. Numbers are saved under that
+email in kka_orders.json. get_code waits up to 5 minutes for an OTP.
 code_passed clicks the check mark on numbers whose code was read, and the
 close icon on the other numbers for that email. It then deletes that
 email's phone numbers from kka_orders.json.
@@ -46,6 +47,7 @@ OTP_WAIT_SECONDS = 300
 ORDER_WAIT_SECONDS = 30
 CLOSE_WAIT_SECONDS = 180
 CAPTCHA_WAIT_SECONDS = 90
+ACTION_PAUSE = 1.0
 
 
 def load_env(path: Path) -> None:
@@ -150,14 +152,22 @@ def normalize_type(value: str) -> str:
     raise ValueError("type must be gmx or webde")
 
 
+def search_placeholder(part: str) -> str:
+    if part == "service":
+        return "search by service"
+    if part == "country":
+        return "search by country"
+    return part.lower()
+
+
 def order_count(override: int | None = None) -> int:
     if override is None:
         raw = os.environ.get("HERO_SMS_ORDER_COUNT", "3").strip() or "3"
         if not raw.isdigit():
-            raise ValueError("HERO_SMS_ORDER_COUNT must be a number from 1 to 4")
+            raise ValueError("HERO_SMS_ORDER_COUNT must be a number from 1 to 10")
         override = int(raw)
-    if override < 1 or override > 4:
-        raise ValueError("count must be from 1 to 4")
+    if override < 1 or override > 10:
+        raise ValueError("count must be from 1 to 10")
     return override
 
 
@@ -613,32 +623,12 @@ class Dashboard:
         raise SmsError(f"Page did not finish loading ({last or BASE_URL})")
 
     def dismiss_overlays(self) -> list[str]:
-        expression = (
-            "(() => {"
-            + VISIBLE_FN
-            + " const clickLabel = (wanted) => {"
-            "   const button = [...document.querySelectorAll('button')].find((el) => visible(el) && norm(el) === wanted);"
-            "   if (!button) return false;"
-            "   button.scrollIntoView({block: 'center', inline: 'center'});"
-            "   button.click();"
-            "   return true;"
-            " };"
-            " const actions = [];"
-            " if (clickLabel('Accept all cookies')) actions.push('cookies');"
-            " if (clickLabel('Remind me later')) actions.push('later');"
-            " return actions;"
-            "})()"
-        )
-        try:
-            value = self.evaluate(expression, timeout=10)
-        except (RuntimeError, TimeoutError, OSError):
-            return []
-        if not isinstance(value, list):
-            return []
-        actions = [str(item) for item in value]
-        if "cookies" in actions:
+        actions = []
+        if self.click_label("Accept all cookies"):
+            actions.append("cookies")
             log("Accepted cookies")
-        if "later" in actions:
+        if self.click_label("Remind me later"):
+            actions.append("later")
             log("Clicked Remind me later")
         return actions
 
@@ -646,13 +636,13 @@ class Dashboard:
         expression = (
             "(() => {"
             + VISIBLE_FN
-            + " const email = [...document.querySelectorAll('input.text-field__input[type=\"email\"], input[type=\"email\"]')].find(visible);"
+            + " const email = [...document.querySelectorAll('form.modelReg__form input[type=\"email\"], input.text-field__input[type=\"email\"]')].find(visible);"
             " const search = [...document.querySelectorAll('input')].find((el) => visible(el) && /search by service/i.test(el.getAttribute('placeholder') || ''));"
             " const table = [...document.querySelectorAll('tr.base-table__tr, .purchases-table')].find(visible);"
-            " if (email) return 'form';"
-            " if (search || table) return 'ready';"
             " const login = [...document.querySelectorAll('button')].find((el) => visible(el) && norm(el) === 'Log in');"
+            " if (email) return 'form';"
             " if (login) return 'logged-out';"
+            " if (search || table) return 'ready';"
             " return 'unknown';"
             "})()"
         )
@@ -666,42 +656,70 @@ class Dashboard:
             + f" const wanted = {json.dumps(label)};"
             f" const submitOnly = {json.dumps(submit)};"
             " const enabled = (el) => el && !el.disabled && el.getAttribute('aria-disabled') !== 'true';"
+            " const inView = (el) => {"
+            "   const rect = el.getBoundingClientRect();"
+            "   return rect.bottom > 0 && rect.right > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight;"
+            " };"
             " let buttons = [...document.querySelectorAll('button')].filter((el) => visible(el) && norm(el) === wanted);"
+            " const shown = buttons.filter(inView);"
+            " if (shown.length) buttons = shown;"
             " if (submitOnly) {"
             "   const submitted = buttons.filter((el) => el.type === 'submit');"
             "   if (submitted.length) buttons = submitted;"
             " }"
             " const button = buttons.find(enabled);"
-            " if (!button) return false;"
+            " if (!button) return null;"
             " button.scrollIntoView({block: 'center', inline: 'center'});"
-            " button.click();"
-            " return true;"
+            " const rect = button.getBoundingClientRect();"
+            " if (rect.width < 1 || rect.height < 1) return null;"
+            " return {x: rect.left + rect.width / 2, y: rect.top + rect.height / 2};"
             "})()"
         )
         try:
-            return bool(self.evaluate(expression))
+            point = self.box(expression)
         except (RuntimeError, TimeoutError, OSError):
             return False
+        if not point:
+            return False
+        self.mouse_click(float(point["x"]), float(point["y"]))
+        return True
 
-    def click_buy(self, value: str) -> str:
+    def click_buy_for(self, price: str) -> str:
         expression = (
             "(() => {"
             + VISIBLE_FN
-            + f" const wanted = {json.dumps(value)};"
+            + f" const wanted = {json.dumps(price.lstrip('$').strip())};"
+            " const money = (text) => (String(text || '').match(/\\d+(?:\\.\\d+)?/) || [''])[0];"
             " const enabled = (el) => el && !el.disabled && el.getAttribute('aria-disabled') !== 'true';"
-            " const buttons = [...document.querySelectorAll('button')].filter((el) => visible(el) && norm(el).startsWith('Buy for') && norm(el).includes(wanted));"
-            " const button = buttons.find(enabled);"
-            " if (!button) return '';"
-            " button.scrollIntoView({block: 'center', inline: 'center'});"
-            " const text = norm(button);"
-            " button.click();"
-            " return text;"
+            " const inView = (el) => {"
+            "   const rect = el.getBoundingClientRect();"
+            "   return rect.bottom > 0 && rect.right > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight;"
+            " };"
+            " const buyFor = (el) => visible(el) && enabled(el) && norm(el).startsWith('Buy for');"
+            " const menus = [...document.querySelectorAll('div.purchase-menu__content')].filter(visible);"
+            " const menu = menus.find((node) => node.querySelector('input.ds-stepper__input') && [...node.querySelectorAll('button')].some(buyFor)) || menus[0];"
+            " if (!menu) return null;"
+            " let buttons = [...menu.querySelectorAll('button')].filter(buyFor);"
+            " const priced = buttons.filter((el) => money(norm(el)) === wanted);"
+            " if (priced.length) buttons = priced;"
+            " const shown = buttons.filter(inView);"
+            " if (shown.length) buttons = shown;"
+            " const chosen = buttons[0];"
+            " if (!chosen) return null;"
+            " chosen.scrollIntoView({block: 'center', inline: 'center'});"
+            " const rect = chosen.getBoundingClientRect();"
+            " if (rect.width < 1 || rect.height < 1) return null;"
+            " return {x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, text: norm(chosen)};"
             "})()"
         )
         try:
-            return str(self.evaluate(expression) or "")
+            point = self.box(expression)
         except (RuntimeError, TimeoutError, OSError):
             return ""
+        if not point:
+            return ""
+        self.mouse_click(float(point["x"]), float(point["y"]))
+        return str(point.get("text") or "Buy for")
 
     def box(self, expression: str) -> dict | None:
         value = self.evaluate(expression, timeout=10)
@@ -749,11 +767,14 @@ class Dashboard:
         if typed != value:
             raise SmsError(f"Could not fill {selector}")
 
+    def pause(self) -> None:
+        time.sleep(ACTION_PAUSE)
+
     def placeholder_box(self, part: str) -> dict | None:
         expression = (
             "(() => {"
             + VISIBLE_FN
-            + f" const part = {json.dumps(part.lower())};"
+            + f" const part = {json.dumps(search_placeholder(part))};"
             " const el = [...document.querySelectorAll('input')].find((node) => {"
             "   return visible(node) && (node.getAttribute('placeholder') || '').toLowerCase().includes(part);"
             " });"
@@ -783,7 +804,7 @@ class Dashboard:
     def input_value(self, part: str) -> str:
         expression = (
             "(() => {"
-            f" const part = {json.dumps(part.lower())};"
+            f" const part = {json.dumps(search_placeholder(part))};"
             " const el = [...document.querySelectorAll('input')].find((node) => (node.getAttribute('placeholder') || '').toLowerCase().includes(part));"
             " return el ? el.value : '';"
             "})()"
@@ -807,7 +828,7 @@ class Dashboard:
             return
         expression = (
             "(() => {"
-            f" const part = {json.dumps(part.lower())};"
+            f" const part = {json.dumps(search_placeholder(part))};"
             f" const text = {json.dumps(text)};"
             " const el = [...document.querySelectorAll('input')].find((node) => (node.getAttribute('placeholder') || '').toLowerCase().includes(part));"
             " if (!el) return '';"
@@ -848,21 +869,26 @@ class Dashboard:
             " const list = lists.find((ul) => visible(ul) && ul.querySelector('li'));"
             " if (!list) return '';"
             " const item = [...list.querySelectorAll('li')].find(visible);"
-            " if (!item) return '';"
+            " if (!item) return null;"
             " item.scrollIntoView({block: 'center', inline: 'center'});"
-            " const target = item.querySelector('button, a, label') || item;"
-            " const text = norm(item);"
-            " target.click();"
-            " return text;"
+            " const rect = item.getBoundingClientRect();"
+            " if (rect.width < 1 || rect.height < 1) return null;"
+            " return {x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, text: norm(item)};"
             "})()"
         )
         try:
-            return str(self.evaluate(expression, timeout=10) or "")
+            point = self.box(expression)
         except (RuntimeError, TimeoutError, OSError):
             return ""
+        if not point:
+            return ""
+        self.mouse_click(float(point["x"]), float(point["y"]))
+        return str(point.get("text") or "")
 
     def search_pick(self, part: str, query: str, list_class: str) -> str:
+        log(f"Typing {query} into {part}")
         self.replace_text(part, query)
+        self.pause()
         wanted = re.sub(r"[^a-z0-9]", "", query.lower())
         seen = ""
         deadline = time.time() + 10
@@ -877,10 +903,11 @@ class Dashboard:
             raise SmsError(f"No {part} matched {query!r}")
         self.focus_placeholder(part, timeout=3)
         self.press_enter()
-        time.sleep(0.4)
+        log(f"Pressed Enter for {query}")
+        self.pause()
         picked = self.click_first_item(list_class) or seen
         log(f"Selected {picked}")
-        time.sleep(0.6)
+        self.pause()
         return picked
 
     def offers_visible(self) -> bool:
@@ -908,19 +935,25 @@ class Dashboard:
         expression = (
             "(() => {"
             + VISIBLE_FN
-            + " const lists = [...document.querySelectorAll('ul.free-price-offers__list')].filter(visible);"
-            " const list = lists[0];"
+            + " const priced = (input) => input && /^\\d+(?:\\.\\d+)?$/.test(input.value || '');"
+            " const lists = [...document.querySelectorAll('ul.free-price-offers__list')].filter(visible);"
+            " const ranked = lists.map((ul) => ({"
+            "   ul,"
+            "   count: [...ul.querySelectorAll('input.ds-radio__input')].filter(priced).length"
+            " })).filter((item) => item.count > 0).sort((a, b) => b.count - a.count);"
+            " const list = ranked.length ? ranked[0].ul : null;"
             " if (!list) return [];"
-            " return [...list.querySelectorAll('li')].filter(visible).map((li) => {"
-            "   const input = li.querySelector('input[type=radio]');"
+            " return [...list.querySelectorAll('li')].map((li) => {"
+            "   const input = li.querySelector('input.ds-radio__input');"
+            "   if (!priced(input)) return null;"
             "   const price = li.querySelector('.heading-small');"
             "   const stock = li.querySelector('.free-price-offers__info .body-medium');"
             "   return {"
-            "     value: input ? (input.value || '') : '',"
+            "     value: input.value,"
             "     priceText: norm(price),"
             "     stockText: norm(stock)"
             "   };"
-            " });"
+            " }).filter(Boolean);"
             "})()"
         )
         try:
@@ -941,7 +974,7 @@ class Dashboard:
                 continue
             offers.append(
                 {
-                    "value": radio or price_text,
+                    "value": price_text or radio,
                     "price": price,
                     "price_text": price_text or radio,
                     "stock": parse_pcs(stock_text),
@@ -951,29 +984,76 @@ class Dashboard:
         offers.sort(key=lambda offer: offer["price"])
         return offers
 
-    def select_offer(self, value: str) -> bool:
+    def offer_target(self, value: str, part: str) -> dict | None:
         expression = (
             "(() => {"
             + VISIBLE_FN
             + f" const wanted = {json.dumps(value)};"
-            " const items = [...document.querySelectorAll('ul.free-price-offers__list li')].filter(visible);"
-            " const li = items.find((node) => {"
-            "   const input = node.querySelector('input[type=radio]');"
-            "   return input && input.value === wanted;"
+            + f" const part = {json.dumps(part)};"
+            " const money = (text) => (String(text || '').match(/\\d+(?:\\.\\d+)?/) || [''])[0];"
+            " const priced = (input) => input && /^\\d+(?:\\.\\d+)?$/.test(input.value || '');"
+            " const lists = [...document.querySelectorAll('ul.free-price-offers__list')].filter(visible);"
+            " const ranked = lists.map((ul) => ({"
+            "   ul,"
+            "   count: [...ul.querySelectorAll('input.ds-radio__input')].filter(priced).length"
+            " })).filter((item) => item.count > 0).sort((a, b) => b.count - a.count);"
+            " const list = ranked.length ? ranked[0].ul : null;"
+            " if (!list) return null;"
+            " const wantedMoney = money(wanted);"
+            " const li = [...list.querySelectorAll('li')].find((node) => {"
+            "   const input = node.querySelector('input.ds-radio__input');"
+            "   const price = norm(node.querySelector('.heading-small'));"
+            "   return priced(input) && (input.value === wantedMoney || money(price) === wantedMoney);"
             " });"
-            " if (!li) return false;"
-            " li.scrollIntoView({block: 'center', inline: 'center'});"
-            " const input = li.querySelector('input[type=radio]');"
-            " const label = li.querySelector('label') || li;"
-            " if (input) input.click();"
-            " label.click();"
-            " return true;"
+            " if (!li) return null;"
+            " const icon = li.querySelector('.ds-radio__icon');"
+            " const target = part === 'icon' ? (icon || li.querySelector('label.ds-radio') || li) : li;"
+            " target.scrollIntoView({block: 'center', inline: 'center'});"
+            " const rect = target.getBoundingClientRect();"
+            " if (rect.width < 1 || rect.height < 1) return null;"
+            " const x = part === 'icon' ? rect.left + Math.min(12, rect.width / 2) : rect.left + 24;"
+            " return {x, y: rect.top + rect.height / 2};"
             "})()"
         )
         try:
-            return bool(self.evaluate(expression))
+            return self.box(expression)
+        except (RuntimeError, TimeoutError, OSError):
+            return None
+
+    def offer_checked(self, value: str) -> bool:
+        expression = (
+            "(() => {"
+            + VISIBLE_FN
+            + f" const wanted = {json.dumps(value)};"
+            " const money = (text) => (String(text || '').match(/\\d+(?:\\.\\d+)?/) || [''])[0];"
+            " const priced = (input) => input && /^\\d+(?:\\.\\d+)?$/.test(input.value || '');"
+            " const lists = [...document.querySelectorAll('ul.free-price-offers__list')].filter(visible);"
+            " const ranked = lists.map((ul) => ({"
+            "   ul,"
+            "   count: [...ul.querySelectorAll('input.ds-radio__input')].filter(priced).length"
+            " })).filter((item) => item.count > 0).sort((a, b) => b.count - a.count);"
+            " const list = ranked.length ? ranked[0].ul : null;"
+            " if (!list) return false;"
+            " const wantedMoney = money(wanted);"
+            " const input = [...list.querySelectorAll('input.ds-radio__input')].find((node) => priced(node) && node.value === wantedMoney);"
+            " return !!(input && input.checked);"
+            "})()"
+        )
+        try:
+            return bool(self.evaluate(expression, timeout=10))
         except (RuntimeError, TimeoutError, OSError):
             return False
+
+    def select_offer(self, value: str) -> bool:
+        for part in ("icon", "row"):
+            point = self.offer_target(value, part)
+            if not point:
+                return False
+            self.mouse_click(float(point["x"]), float(point["y"]))
+            time.sleep(0.3)
+            if self.offer_checked(value):
+                return True
+        return False
 
     def list_rows(self) -> list[dict]:
         expression = (
@@ -1022,18 +1102,29 @@ class Dashboard:
     def click_turnstile(self) -> bool:
         expression = (
             "(() => {"
+            " const boxOf = (el) => {"
+            "   if (!el) return null;"
+            "   el.scrollIntoView({block: 'center', inline: 'center'});"
+            "   const rect = el.getBoundingClientRect();"
+            "   if (rect.width < 20 || rect.height < 20) return null;"
+            "   return {left: rect.left, top: rect.top, width: rect.width, height: rect.height,"
+            "     x: rect.left + rect.width / 2, y: rect.top + rect.height / 2};"
+            " };"
+            " const token = document.querySelector('[name=\"cf-turnstile-response\"]');"
+            " const host = token && token.parentElement;"
+            " const hostBox = boxOf(host);"
+            " if (hostBox) return hostBox;"
             " const interesting = (frame) => {"
             "   const blob = ((frame.getAttribute('src') || '') + ' ' + (frame.getAttribute('title') || '')).toLowerCase();"
             "   return blob.includes('cloudflare') || blob.includes('turnstile') || blob.includes('challenge');"
             " };"
-            " const frames = [...document.querySelectorAll('iframe')].filter(interesting);"
-            " const el = frames[0] || document.querySelector('.cf-turnstile, #turnstile');"
-            " if (!el) return null;"
-            " el.scrollIntoView({block: 'center', inline: 'center'});"
-            " const rect = el.getBoundingClientRect();"
-            " if (rect.width < 2 || rect.height < 2) return null;"
-            " return {left: rect.left, top: rect.top, width: rect.width, height: rect.height,"
-            "   x: rect.left + rect.width / 2, y: rect.top + rect.height / 2};"
+            " const frames = [];"
+            " const walk = (root) => {"
+            "   frames.push(...[...root.querySelectorAll('iframe')].filter(interesting));"
+            "   for (const node of root.querySelectorAll('*')) if (node.shadowRoot) walk(node.shadowRoot);"
+            " };"
+            " walk(document);"
+            " return boxOf(frames[0] || document.querySelector('.cf-turnstile, #turnstile'));"
             "})()"
         )
         try:
@@ -1086,10 +1177,10 @@ class Dashboard:
         clicks = 0
         while time.time() < deadline:
             self.dismiss_overlays()
-            if self.login_enabled():
+            if self.captcha_token() > 0:
                 log("Captcha passed")
                 return True
-            if clicks < 2 and self.captcha_token() == 0 and time.time() - self._last_captcha_click > 4:
+            if clicks < 4 and time.time() - self._last_captcha_click > 4:
                 if self.click_turnstile():
                     clicks += 1
                     log("Clicked the captcha")
@@ -1146,12 +1237,23 @@ class Dashboard:
             log("Already signed in")
             return
         if state != "form":
-            if not self.click_label("Log in"):
-                raise SmsError("Could not find the Log in button")
-            if not self.wait_state("form", 20):
-                if self.session_state() == "ready":
+            opened = False
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                self.dismiss_overlays()
+                try:
+                    state = self.session_state()
+                except (RuntimeError, TimeoutError, OSError):
+                    state = "unknown"
+                if state == "form":
+                    opened = True
+                    break
+                if state == "ready":
                     log("Already signed in")
                     return
+                self.click_label("Log in")
+                time.sleep(0.8)
+            if not opened and self.session_state() != "form":
                 raise SmsError("Could not find the email and password fields")
         self.fill('input.text-field__input[type="email"]', HERO_SMS_EMAIL)
         self.fill('input.text-field__input[type="password"]', HERO_SMS_PASSWORD)
@@ -1200,59 +1302,222 @@ class Dashboard:
         if not picked:
             raise SmsError(last_error)
         self.search_pick("country", COUNTRY, "country-list")
-        if self.offers_visible():
-            return
-        if not self.click_label("Buy with Settings"):
-            time.sleep(0.8)
+        if not self.click_settings():
+            self.pause()
             self.dismiss_overlays()
-            if not self.click_label("Buy with Settings"):
+            if not self.click_settings():
                 raise SmsError("Could not find Buy with Settings")
+        log("Clicked Buy with Settings")
+        self.pause()
         if not self.wait_offers(15):
             raise SmsError("Could not find the price list")
 
-    def purchase(self, value: str) -> dict:
-        self.dismiss_overlays()
+    def click_settings(self) -> bool:
+        expression = (
+            "(() => {"
+            + VISIBLE_FN
+            + " const enabled = (el) => el && !el.disabled && el.getAttribute('aria-disabled') !== 'true';"
+            " const inView = (el) => {"
+            "   const rect = el.getBoundingClientRect();"
+            "   return rect.bottom > 0 && rect.right > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight;"
+            " };"
+            " let buttons = [...document.querySelectorAll('button.buy-action-buttons__back-btn, button')]"
+            "   .filter((el) => visible(el) && enabled(el) && (el.classList.contains('buy-action-buttons__back-btn') || norm(el) === 'Buy with Settings'));"
+            " const shown = buttons.filter(inView);"
+            " if (shown.length) buttons = shown;"
+            " const button = buttons.find((el) => norm(el) === 'Buy with Settings') || buttons[0];"
+            " if (!button) return null;"
+            " button.scrollIntoView({block: 'center', inline: 'center'});"
+            " const rect = button.getBoundingClientRect();"
+            " if (rect.width < 1 || rect.height < 1) return null;"
+            " return {x: rect.left + rect.width / 2, y: rect.top + rect.height / 2};"
+            "})()"
+        )
         try:
-            before = {self.row_key(row) for row in self.list_rows()}
+            point = self.box(expression)
         except (RuntimeError, TimeoutError, OSError):
-            before = set()
+            return False
+        if not point:
+            return False
+        self.mouse_click(float(point["x"]), float(point["y"]))
+        return True
+
+    def mark_stepper(self) -> dict | None:
+        expression = (
+            "(() => {"
+            + VISIBLE_FN
+            + " const inView = (el) => {"
+            "   const rect = el.getBoundingClientRect();"
+            "   return rect.bottom > 0 && rect.right > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight;"
+            " };"
+            " document.querySelectorAll('[data-hero-qty]').forEach((el) => el.removeAttribute('data-hero-qty'));"
+            " const menus = [...document.querySelectorAll('div.purchase-menu__content')].filter(visible);"
+            " const menu = menus.find((node) => visible(node.querySelector('input.ds-stepper__input'))) || menus[0];"
+            " if (!menu) return null;"
+            " const inputs = [...menu.querySelectorAll('input.ds-stepper__input')].filter(visible);"
+            " const ranked = inputs.map((input) => ({input, shown: inView(input)})).sort((a, b) => Number(b.shown) - Number(a.shown));"
+            " const chosen = ranked[0];"
+            " if (!chosen) return null;"
+            " chosen.input.setAttribute('data-hero-qty', '1');"
+            " chosen.input.scrollIntoView({block: 'center', inline: 'center'});"
+            " const rect = chosen.input.getBoundingClientRect();"
+            " if (rect.width < 1 || rect.height < 1) return null;"
+            " return {x: rect.left + rect.width / 2, y: rect.top + rect.height / 2};"
+            "})()"
+        )
+        try:
+            return self.box(expression)
+        except (RuntimeError, TimeoutError, OSError):
+            return None
+
+    def quantity_value(self) -> str:
+        expression = (
+            "(() => {"
+            " const el = document.querySelector('div.purchase-menu__content input[data-hero-qty]');"
+            " return el ? String(el.value || '').trim() : '';"
+            "})()"
+        )
+        try:
+            return str(self.evaluate(expression, timeout=10) or "")
+        except (RuntimeError, TimeoutError, OSError):
+            return ""
+
+    def write_quantity(self, count: int) -> None:
+        expression = (
+            "(() => {"
+            " const el = document.querySelector('div.purchase-menu__content input[data-hero-qty]');"
+            " if (!el) return '';"
+            " el.focus();"
+            " const proto = Object.getPrototypeOf(el);"
+            " const desc = Object.getOwnPropertyDescriptor(proto, 'value')"
+            "   || Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');"
+            f" desc.set.call(el, {json.dumps(str(count))});"
+            " el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: el.value}));"
+            " el.dispatchEvent(new Event('change', {bubbles: true}));"
+            " el.dispatchEvent(new Event('blur', {bubbles: true}));"
+            " return el.value;"
+            "})()"
+        )
+        self.evaluate(expression)
+
+    def nudge_quantity(self, count: int) -> bool:
+        current = self.quantity_value()
+        if not current.isdigit():
+            return False
+        for _ in range(12):
+            value = int(self.quantity_value() or "0")
+            if value == count:
+                return True
+            direction = "plus" if value < count else "minus"
+            expression = (
+                "(() => {"
+                + VISIBLE_FN
+                + f" const direction = {json.dumps(direction)};"
+                " const input = document.querySelector('div.purchase-menu__content input[data-hero-qty]');"
+                " if (!input) return null;"
+                " const root = input.closest('.ds-stepper') || input.closest('.purchase-menu__content');"
+                " if (!root) return null;"
+                " const rect = input.getBoundingClientRect();"
+                " const button = [...root.querySelectorAll('button')].find((el) => {"
+                "   if (!visible(el)) return false;"
+                "   const box = el.getBoundingClientRect();"
+                "   return direction === 'plus' ? box.left >= rect.right - 2 : box.right <= rect.left + 2;"
+                " });"
+                " if (!button) return null;"
+                " const box = button.getBoundingClientRect();"
+                " if (box.width < 1 || box.height < 1) return null;"
+                " return {x: box.left + box.width / 2, y: box.top + box.height / 2};"
+                "})()"
+            )
+            try:
+                point = self.box(expression)
+            except (RuntimeError, TimeoutError, OSError):
+                return False
+            if not point:
+                return False
+            self.mouse_click(float(point["x"]), float(point["y"]))
+            self.pause()
+        return self.quantity_value() == str(count)
+
+    def set_quantity(self, count: int) -> bool:
+        point = self.mark_stepper()
+        if not point:
+            return False
+        self.mouse_click(float(point["x"]), float(point["y"]))
+        time.sleep(0.15)
+        self.press_key("a", "KeyA", 65, modifiers=2)
+        self.press_key("Backspace", "Backspace", 8)
+        if self.cdp is None:
+            raise SmsError("Browser is not connected")
+        self.cdp.call("Input.insertText", {"text": str(count)})
+        self.pause()
+        if self.quantity_value() != str(count):
+            self.write_quantity(count)
+            self.pause()
+        if self.quantity_value() != str(count) and not self.nudge_quantity(count):
+            return False
+        log(f"Set order count to {count}")
+        return True
+
+    def purchase(self, value: str, known: set[str] | None, count: int) -> dict:
+        self.dismiss_overlays()
+        before = {key for key in (known or set()) if key}
+        try:
+            before.update(self.row_key(row) for row in self.list_rows())
+        except (RuntimeError, TimeoutError, OSError):
+            pass
         if not self.select_offer(value):
-            return {"ok": False, "error": "Price option disappeared"}
+            return {"ok": False, "clicked": False, "error": "Could not select the price"}
+        log(f"Selected {value}")
+        self.pause()
+        if not self.set_quantity(count):
+            return {"ok": False, "clicked": False, "error": "Could not set the order count"}
         enabled = ""
         deadline = time.time() + 8
         while time.time() < deadline:
-            enabled = self.click_buy(value)
+            enabled = self.click_buy_for(value)
             if enabled:
                 break
             time.sleep(0.3)
         if not enabled:
-            return {"ok": False, "error": "Buy button stayed disabled"}
+            return {"ok": False, "clicked": False, "error": "Buy button stayed disabled"}
         log(f"Clicked {enabled}")
+        self.pause()
+        found: list[dict] = []
+        seen = set(before)
         deadline = time.time() + ORDER_WAIT_SECONDS
-        while time.time() < deadline:
+        while time.time() < deadline and len(found) < count:
             self.dismiss_overlays()
             try:
                 rows = self.list_rows()
             except (RuntimeError, TimeoutError, OSError):
                 time.sleep(0.4)
                 continue
-            fresh = [row for row in rows if self.row_key(row) and self.row_key(row) not in before]
-            fresh = [row for row in fresh if len(self.row_key(row)) >= 10]
+            fresh = [row for row in rows if self.row_key(row) and self.row_key(row) not in seen and len(self.row_key(row)) >= 10]
             near = [row for row in fresh if clock_distance(row.get("time") or "") <= 5]
             pool = near or fresh
-            if pool:
-                pool.sort(key=lambda row: clock_distance(row.get("time") or ""))
-                row = pool[0]
+            pool.sort(key=lambda row: clock_distance(row.get("time") or ""))
+            for row in pool:
+                if len(found) >= count:
+                    break
                 phone = plus_phone(self.row_key(row))
-                if phone:
-                    return {
-                        "ok": True,
+                key = digits(phone)
+                if not phone or not key or key in seen:
+                    continue
+                seen.add(key)
+                found.append(
+                    {
                         "phone": phone,
                         "time": row.get("time") or "",
                         "price": row.get("price") or "",
                     }
+                )
+            if len(found) >= count:
+                break
             time.sleep(0.5)
-        return {"ok": False, "error": "Buy did not create a new number"}
+        if not found:
+            return {"ok": False, "clicked": True, "error": "Buy did not create a new number"}
+        return {"ok": True, "clicked": True, "phones": found}
 
     def read_otp(self, phone: str) -> str:
         for row in self.list_rows():
@@ -1387,56 +1652,54 @@ class NumberService:
         self.browser.ensure_session()
         phones: list[str] = []
         orders: list[dict] = []
-        exhausted: set[str] = set()
+        known: set[str] = set()
+        clicked = False
         attempts = 0
-        limit = max(count * 6, 6)
         failure = "failed get number"
         try:
-            while len(phones) < count and attempts < limit:
+            try:
+                known.update(self.browser.row_key(row) for row in self.browser.list_rows())
+            except (RuntimeError, TimeoutError, OSError):
+                pass
+            while not clicked and attempts < 4:
                 attempts += 1
                 self.browser.dismiss_overlays()
-                if not self.browser.offers_visible():
-                    self.browser.prepare_catalog(kind)
+                self.browser.prepare_catalog(kind)
                 offers = [
                     offer
                     for offer in self.browser.list_offers()
-                    if offer["stock"] is not None and offer["stock"] > 0 and offer["value"] not in exhausted
+                    if offer["stock"] is not None and offer["stock"] > 0
                 ]
                 if not offers:
-                    seen = self.browser.list_offers()
-                    if seen:
-                        summary = ", ".join(
-                            f"{offer['price_text']} ({offer['stock_text'] or 'no stock'})" for offer in seen[:6]
-                        )
-                        log(f"No price with stock above zero. Saw {summary}")
-                    else:
-                        log("No price list to buy from")
+                    log("No price with stock above zero")
                     failure = "failed get number"
                     break
                 offer = offers[0]
                 stock_label = offer["stock_text"] or f"{offer['stock']} pcs"
-                log(f"Buying cheapest at {offer['price_text']} ({stock_label})")
+                log(f"Buying {count} at {offer['price_text']} ({stock_label})")
                 try:
-                    result = self.browser.purchase(offer["value"])
+                    result = self.browser.purchase(offer["value"], known, count)
                 except (RuntimeError, TimeoutError, OSError) as exc:
                     log(f"Buy failed: {exc}")
-                    exhausted.add(offer["value"])
                     continue
+                clicked = bool(result.get("clicked"))
                 if not result.get("ok"):
                     log(str(result.get("error") or "Buy was rejected"))
-                    exhausted.add(offer["value"])
                     continue
-                phone = str(result.get("phone") or "")
-                if any(same_phone(phone, existing) for existing in phones):
-                    log("Buy did not create a new number")
-                    exhausted.add(offer["value"])
-                    continue
-                price = str(result.get("price") or offer["price_text"])
-                bought_at = str(result.get("time") or "")
-                self.store.add(email, kind, phone, price, bought_at)
-                phones.append(phone)
-                orders.append({"phone": phone, "price": price, "time": bought_at})
-                log(f"Saved {phone} for {email}")
+                for item in result.get("phones") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    phone = str(item.get("phone") or "")
+                    key = digits(phone)
+                    if not key or key in known or any(same_phone(phone, existing) for existing in phones):
+                        continue
+                    known.add(key)
+                    price = str(item.get("price") or offer["price_text"])
+                    bought_at = str(item.get("time") or "")
+                    self.store.add(email, kind, phone, price, bought_at)
+                    phones.append(phone)
+                    orders.append({"phone": phone, "price": price, "time": bought_at})
+                    log(f"Saved {phone} for {email}")
         except SmsError as exc:
             failure = str(exc)
             log(failure)
@@ -1652,7 +1915,7 @@ def main() -> None:
         server.server_close()
         raise
     log(f"Listening on http://{HERO_SMS_HOST}:{HERO_SMS_PORT}")
-    log(f"Ordering {wanted} {COUNTRY} numbers per get_started call")
+    log(f"Ordering {wanted} {COUNTRY} numbers with one buy")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
