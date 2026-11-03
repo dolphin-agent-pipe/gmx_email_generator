@@ -23,7 +23,7 @@ Create these local files. All of them are gitignored:
 `.env` example:
 
 ```
-TARGET_URL=https://www.gmx.net/
+TARGET_URL1=https://www.gmx.net/
 ANOSIM_EMAIL=
 ANOSIM_PASSWORD=
 ANOSIM_MODE=TEST
@@ -48,7 +48,7 @@ The first argument is the Dolphin profile name. It does not have to be an email 
 | `--street` | Street and house number, 1–49 characters |
 | `--country` | Form country code, default `DE` |
 | `--password` | Mailbox password, 1–100 characters. GMX expects at least 12 characters with letters, numbers, and symbols |
-| `--url` | Page to open. Default is `TARGET_URL` |
+| `--url` | Page to open. Default is `TARGET_URL1` |
 | `--proxies` | Proxy file. Default is `proxies.txt` |
 | `--proxy-type` | `http` (default), `https`, `socks5`, or `socks4`. A failed `http` check is retried as `socks5` |
 | `--skip-check` | Skip the Dolphin proxy test |

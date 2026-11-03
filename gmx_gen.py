@@ -1,4 +1,4 @@
-"""Create a Dolphin Anty profile with the name you provide, open TARGET_URL from .env, click through to registration, and fill the signup form.
+"""Create a Dolphin Anty profile with the name you provide, open TARGET_URL1 from .env, click through to registration, and fill the signup form.
 
 A random proxy from proxies.txt is attached to that profile.
 Dolphin Anty must already be running and logged in on this machine.
@@ -53,7 +53,7 @@ def load_env(path: Path) -> None:
 
 
 load_env(ENV_FILE)
-TARGET_URL = os.environ.get("TARGET_URL", "").strip()
+TARGET_URL1 = os.environ.get("TARGET_URL1", "").strip()
 LOCAL_API = os.environ.get("DOLPHIN_LOCAL_API", "http://127.0.0.1:3001").rstrip("/")
 
 
@@ -1724,7 +1724,7 @@ def resolve_proxy_type(session: requests.Session, proxy: dict, proxy_type: str, 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Create a Dolphin profile, open TARGET_URL, and submit the signup form."
+        description="Create a Dolphin profile, open TARGET_URL1, and submit the signup form."
     )
     parser.add_argument("email", nargs="?", help="Name for the Dolphin profile")
     parser.add_argument("--first-name", help="First name for the signup form")
@@ -1737,7 +1737,7 @@ def main() -> None:
     parser.add_argument("--street", help="Street and house number")
     parser.add_argument("--country", default="DE", help="Country code, for example DE")
     parser.add_argument("--password", help="Password for the new mailbox")
-    parser.add_argument("--url", default=TARGET_URL, help="Page to open (default: TARGET_URL from .env)")
+    parser.add_argument("--url", default=TARGET_URL1, help="Page to open (default: TARGET_URL1 from .env)")
     parser.add_argument(
         "--proxies",
         default=str(ROOT / "proxies.txt"),
@@ -1779,7 +1779,7 @@ def main() -> None:
     if not password or len(password) > 100:
         raise SystemExit("Password must be 1 to 100 characters")
     if not args.url:
-        raise SystemExit(f"Set TARGET_URL in {ENV_FILE}")
+        raise SystemExit(f"Set TARGET_URL1 in {ENV_FILE}")
 
     proxy = load_random_proxy(Path(args.proxies))
     session = requests.Session()
