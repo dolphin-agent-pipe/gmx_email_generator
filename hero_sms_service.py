@@ -10,10 +10,11 @@ Keeps one browser signed in and serves three calls:
 Germany, and buys the cheapest price whose stock is above zero. It sets the
 order stepper to HERO_SMS_ORDER_COUNT (default 3, maximum 10) and clicks Buy
 once, so that one click orders every number. Numbers are saved under that
-email in kka_orders.json. get_code opens TARGET_URL3/purchases/numbers and
-waits up to 5 minutes for an OTP on the matching row. code_passed clicks
-complete activation on the row whose code was read, cancels the other rows
-for that email, deletes those saved numbers, and closes the purchases page.
+email in kka_orders.json. get_code opens a new TARGET_URL3/purchases/numbers
+page, waits up to 5 minutes for an OTP on the matching row, and closes that
+page when it returns. code_passed clicks complete activation on the row whose
+code was read, cancels the other rows for that email, and deletes those saved
+numbers.
 
 Calls wait in one queue so the browser does one thing at a time.
 
@@ -646,7 +647,7 @@ class Dashboard:
                 self.goto(PURCHASES_URL)
                 self.dismiss_overlays()
 
-    def open_code_page(self) -> None:
+    def open_code_page(self) -> str:
         if not PURCHASES_URL:
             raise SmsError("Set TARGET_URL3 in the environment")
         self.ensure_browser()
@@ -661,39 +662,43 @@ class Dashboard:
             raise SmsError("Could not open the purchases page")
         page = self._wait_page(target_id)
         self.code_page_ids.append(target_id)
-        self._connect(page)
         try:
-            browser_call(DEBUG_PORT, "Target.activateTarget", {"targetId": target_id})
-        except (OSError, urllib.error.URLError, json.JSONDecodeError, RuntimeError, TimeoutError):
-            pass
-        if "purchases/numbers" not in self.href():
-            self.goto(PURCHASES_URL)
-        self.dismiss_overlays()
-        try:
-            state = self.session_state()
-        except (RuntimeError, TimeoutError, OSError):
-            state = "unknown"
-        if state != "ready":
-            self.ensure_session()
+            self._connect(page)
+            try:
+                browser_call(DEBUG_PORT, "Target.activateTarget", {"targetId": target_id})
+            except (OSError, urllib.error.URLError, json.JSONDecodeError, RuntimeError, TimeoutError):
+                pass
             if "purchases/numbers" not in self.href():
                 self.goto(PURCHASES_URL)
-                self.dismiss_overlays()
+            self.dismiss_overlays()
+            try:
+                state = self.session_state()
+            except (RuntimeError, TimeoutError, OSError):
+                state = "unknown"
+            if state != "ready":
+                self.ensure_session()
+                if "purchases/numbers" not in self.href():
+                    self.goto(PURCHASES_URL)
+                    self.dismiss_overlays()
+        except Exception:
+            self.close_code_page(target_id)
+            raise
+        return target_id
 
-    def close_purchases(self) -> None:
-        targets = list(self.code_page_ids)
-        self.code_page_ids.clear()
+    def close_code_page(self, target_id: str) -> None:
+        if target_id in self.code_page_ids:
+            self.code_page_ids.remove(target_id)
         try:
             self.restore_buy()
         except (SmsError, RuntimeError, TimeoutError, OSError) as exc:
             log(f"Could not return to the order page: {exc}")
-        if not targets:
+        if not target_id:
             return
         log("Closing the purchases page")
-        for target in targets:
-            try:
-                browser_call(DEBUG_PORT, "Target.closeTarget", {"targetId": target})
-            except (OSError, urllib.error.URLError, json.JSONDecodeError, RuntimeError, TimeoutError) as exc:
-                log(f"Could not close the purchases page: {exc}")
+        try:
+            browser_call(DEBUG_PORT, "Target.closeTarget", {"targetId": target_id})
+        except (OSError, urllib.error.URLError, json.JSONDecodeError, RuntimeError, TimeoutError) as exc:
+            log(f"Could not close the purchases page: {exc}")
 
     def evaluate(self, expression: str, timeout: float = 30):
         if self.cdp is None:
@@ -1637,15 +1642,15 @@ class Dashboard:
         previous: tuple[str, ...] | None = None
         steady = 0
         latest: list[dict] = []
-        while time.time() - started < 15:
+        while time.time() - started < 20:
             try:
                 latest = self.list_rows()
             except (RuntimeError, TimeoutError, OSError):
                 latest = []
-            keys = tuple(self.row_key(row) for row in latest)
-            if previous == keys:
+            keys = tuple(key for key in (self.row_key(row) for row in latest) if key)
+            if keys and previous == keys:
                 steady += 1
-                if steady >= 2 and (keys or time.time() - started >= 5):
+                if steady >= 2:
                     return latest
             else:
                 steady = 0
@@ -1657,8 +1662,12 @@ class Dashboard:
         keys: set[str] = set()
         try:
             self.open_purchases()
-            self.reload()
-            keys.update(key for key in (self.row_key(row) for row in self.purchase_rows()) if key)
+            rows = self.purchase_rows()
+            if not any(self.row_key(row) for row in rows):
+                log("Purchases table was not ready. Opening it again.")
+                self.goto(PURCHASES_URL)
+                rows = self.purchase_rows()
+            keys.update(key for key in (self.row_key(row) for row in rows) if key)
             log(f"Saw {len(keys)} existing numbers")
         except (SmsError, RuntimeError, TimeoutError, OSError) as exc:
             log(f"Could not read the current purchases: {exc}")
@@ -1677,8 +1686,8 @@ class Dashboard:
         except (SmsError, RuntimeError, TimeoutError, OSError) as exc:
             log(f"Could not open the purchases page: {exc}")
             return found
-        deadline = time.time() + ORDER_WAIT_SECONDS
-        next_reload = time.time() + PURCHASES_REFRESH_SECONDS
+        deadline = time.time() + 45
+        reloaded = False
         try:
             while time.time() < deadline and len(found) < count:
                 try:
@@ -1702,14 +1711,16 @@ class Dashboard:
                             "price": row.get("price") or "",
                         }
                     )
+                    log(f"New number {phone}")
                 if len(found) >= count or time.time() >= deadline:
                     break
-                if time.time() >= next_reload:
+                if not reloaded and time.time() > deadline - 25:
+                    reloaded = True
                     try:
                         self.reload()
                     except (SmsError, RuntimeError, TimeoutError, OSError) as exc:
                         log(f"Could not refresh the purchases page: {exc}")
-                    next_reload = time.time() + PURCHASES_REFRESH_SECONDS
+                    time.sleep(3)
                 else:
                     time.sleep(1)
         finally:
@@ -1944,8 +1955,9 @@ class NumberService:
         return self._submit(f"get_code {number}", lambda number=number: self._get_code(number))
 
     def _get_code(self, number: str) -> dict:
-        self.browser.open_code_page()
+        target = ""
         try:
+            target = self.browser.open_code_page()
             deadline = time.monotonic() + OTP_WAIT_SECONDS
             next_reload = time.monotonic() + PURCHASES_REFRESH_SECONDS
             found_row = False
@@ -1979,7 +1991,7 @@ class NumberService:
             log(f"No OTP for {number} within 5 minutes")
             return {"ok": False, "error": "failed", "phone": plus_phone(number)}
         finally:
-            self.browser.restore_buy()
+            self.browser.close_code_page(target)
 
     def code_passed(self, email: str) -> dict:
         email = email.strip()
@@ -1994,13 +2006,9 @@ class NumberService:
             if item.get("status") in {"active", "coded"} and item.get("phone")
         ]
         if not records:
-            self.browser.close_purchases()
             return {"ok": False, "error": "unknown email", "email": email, "results": []}
         self.browser.open_purchases()
-        try:
-            return self._finish_numbers(email, records)
-        finally:
-            self.browser.close_purchases()
+        return self._finish_numbers(email, records)
 
     def _finish_numbers(self, email: str, records: list[dict]) -> dict:
         if not any(item.get("status") == "coded" for item in records):
