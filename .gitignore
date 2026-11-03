@@ -4,3 +4,4 @@ dolphin/apikey.py
 proxies.txt
 freenumber_usage.json
 accounts.json
+.env
