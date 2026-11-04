@@ -983,7 +983,7 @@ def visible_mailbox(cdp: Cdp, fallback: str) -> str:
             cdp,
             "(() => {"
             " const text = document.body ? document.body.innerText : '';"
-            " const match = text.match(/[A-Za-z0-9._%+-]+@gmx\\.[A-Za-z.]+/);"
+            " const match = text.match(/[A-Za-z0-9._%+-]+@(?:gmx|web)\\.[A-Za-z.]+/);"
             " return match ? match[0] : '';"
             "})()",
         )
@@ -1638,6 +1638,7 @@ def fill_signup(
     country: str,
     password: str,
     port: int,
+    phone_step=None,
 ) -> str:
     accept_cookies(cdp, timeout=3)
     deadline = time.time() + 30
@@ -1676,8 +1677,148 @@ def fill_signup(
     time.sleep(pause)
     fill_address(cdp, postal_code, city, street, country)
     fill_password(cdp, password)
-    verify_phone(cdp, port)
+    if phone_step is None:
+        verify_phone(cdp, port)
+    else:
+        phone_step(cdp)
     return visible_mailbox(cdp, mailbox)
+
+
+def verify_supplied_phones(gmx: Cdp, phones: list[str], fetch_code, log=print) -> str:
+    pending = [str(phone).strip() for phone in phones if str(phone).strip()]
+    if not pending:
+        raise NoPhonesLeft("No phone numbers were returned")
+    for source in pending:
+        number = source if source.startswith("+") else f"+{re.sub(r'[^0-9]', '', source)}"
+        log(f"Trying {number}")
+        prefix, national = split_phone(number)
+        deadline = time.time() + 25
+        while time.time() < deadline and not element_box(gmx, "#mobilePhone"):
+            time.sleep(0.4)
+        if not element_box(gmx, "#mobilePhone"):
+            raise SystemExit("Phone form did not appear")
+        selected = select_option(gmx, "#mobilePhonePrefix", prefix)
+        if selected != prefix:
+            raise SystemExit(f"Could not select country code {prefix}")
+        type_into(gmx, "#mobilePhone", national)
+        print(f"Filled {prefix} {national}")
+        if not click_selector(gmx, "button[aria-label='Weiter'][data-testid='next-button']"):
+            raise SystemExit("Could not find the phone Weiter button")
+        print("Clicked Weiter")
+        if phone_number_rejected(gmx):
+            print(f"{number} was rejected")
+            log(f"{number} was rejected")
+            return_to_phone_form(gmx)
+            continue
+        log(f"Waiting for SMS on {number}")
+        code = str(fetch_code(number) or "").strip()
+        if not code:
+            print(f"No SMS code for {number}")
+            log(f"No SMS code for {number}")
+            return_to_phone_form(gmx)
+            continue
+        result = submit_confirmation_code(gmx, code)
+        if result == "accepted":
+            log(f"Verified {number}")
+            return number
+        if result == "closed":
+            print("Confirmation step closed")
+            return number
+        print(f"Confirmation failed for {number}: {result}")
+        log(f"{number} did not verify")
+        return_to_phone_form(gmx)
+    raise NoPhonesLeft("None of the returned phone numbers could finish verification")
+
+
+def generate_mailbox(
+    profile: str,
+    first_name: str,
+    last_name: str,
+    day: str,
+    month: str,
+    year: str,
+    postal_code: str,
+    city: str,
+    street: str,
+    country: str,
+    password: str,
+    url: str,
+    phones: list[str],
+    fetch_code,
+    log=print,
+    proxies: Path | None = None,
+    proxy_type: str = "http",
+    headless: bool = False,
+    skip_check: bool = True,
+) -> tuple[str, str]:
+    profile = normalize_profile_name(profile)
+    first_name = normalize_name(first_name, "First name")
+    last_name = normalize_name(last_name, "Last name")
+    day, month, year = normalize_birth(day, month, year)
+    postal_code = postal_code.strip()
+    city = normalize_name(city, "Ort")
+    street = " ".join(street.split())
+    country = country.strip().upper() or "DE"
+    if not url:
+        raise SystemExit(f"Set TARGET_URL1 in {ENV_FILE}")
+    if not street or len(street) > 49:
+        raise SystemExit("Straße & Hausnummer must be 1 to 49 characters")
+    if not postal_code or len(postal_code) > 10:
+        raise SystemExit("PLZ must be 1 to 10 characters")
+    if not password or len(password) > 100:
+        raise SystemExit("Password must be 1 to 100 characters")
+    used = {"phone": ""}
+
+    def phone_step(cdp: Cdp) -> None:
+        used["phone"] = verify_supplied_phones(cdp, phones, fetch_code, log=log)
+
+    proxy = load_random_proxy(proxies or (ROOT / "proxies.txt"))
+    session = requests.Session()
+    local_login(session)
+    resolved = resolve_proxy_type(session, proxy, proxy_type, skip_check)
+    print(f"Using {proxy_label(proxy, resolved)}")
+    api = DolphinAPI(collect_garbage_on_init=False)
+    profile_id = create_profile(api, profile, proxy, resolved)
+    ws: CdpSocket | None = None
+    cdp: Cdp | None = None
+    try:
+        automation = start_profile(session, profile_id, headless)
+        port = int(automation["port"])
+        print(f"Started {profile} on port {port}")
+        log("Opening the signup form")
+        ws, target_id = connect_page(port)
+        cdp = Cdp(ws)
+        if target_id:
+            try:
+                cdp.call("Target.activateTarget", {"targetId": target_id})
+            except (RuntimeError, TimeoutError) as exc:
+                print(f"Could not focus the tab: {exc}")
+        if not headless:
+            maximize_window(cdp, target_id)
+        navigate(cdp, url)
+        open_registration(cdp)
+        mailbox = fill_signup(
+            cdp,
+            profile,
+            first_name,
+            last_name,
+            day,
+            month,
+            year,
+            postal_code,
+            city,
+            street,
+            country,
+            password,
+            port,
+            phone_step=phone_step,
+        )
+    except BaseException:
+        finish_profile(session, api, profile_id, cdp, ws)
+        raise
+    save_account(mailbox, password)
+    finish_profile(session, api, profile_id, cdp, ws)
+    return mailbox, used["phone"]
 
 
 def ask(value: str | None, label: str) -> str:
