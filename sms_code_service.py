@@ -1,4 +1,4 @@
-"""Long-running phone-number service for TARGET_URL2.
+"""Long-running phone-number service for SERVICE_URL1.
 
 Keeps one browser signed in to the number dashboard and serves three calls:
 
@@ -16,7 +16,7 @@ then deletes the saved phone numbers for that email.
 Several get_started calls at once wait in a queue and run one after another.
 get_code does not wait in that queue: every lookup opens a page of its own.
 
-Requires SMS_CODE_EMAIL and SMS_CODE_PASSWORD in .env, plus TARGET_URL2.
+Requires SMS_CODE_EMAIL and SMS_CODE_PASSWORD in .env, plus SERVICE_URL1.
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ def load_env(path: Path) -> None:
 
 
 load_env(ENV_FILE)
-BASE_URL = os.environ.get("TARGET_URL2", "").strip().rstrip("/")
+BASE_URL = os.environ.get("SERVICE_URL1", "").strip().rstrip("/")
 SMS_CODE_EMAIL = os.environ.get("SMS_CODE_EMAIL", "").strip()
 SMS_CODE_PASSWORD = os.environ.get("SMS_CODE_PASSWORD", "").strip()
 SMS_HOST = os.environ.get("SMS_HOST", "127.0.0.1").strip() or "127.0.0.1"
@@ -1350,7 +1350,7 @@ def listen() -> ServiceServer:
 
 def main() -> None:
     if not BASE_URL:
-        raise SystemExit(f"Set TARGET_URL2 in {ENV_FILE}")
+        raise SystemExit(f"Set SERVICE_URL1 in {ENV_FILE}")
     if not SMS_CODE_EMAIL or not SMS_CODE_PASSWORD:
         raise SystemExit(f"Set SMS_CODE_EMAIL and SMS_CODE_PASSWORD in {ENV_FILE}")
     if not 1 <= SMS_CODE_PORT <= 65535 or not 1 <= DEBUG_PORT <= 65535:

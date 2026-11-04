@@ -1,4 +1,4 @@
-"""Long-running phone-number service for TARGET_URL3.
+"""Long-running phone-number service for SERVICE_URL2.
 
 Keeps one browser signed in and serves three calls:
 
@@ -10,7 +10,7 @@ Keeps one browser signed in and serves three calls:
 Germany, and buys the cheapest price whose stock is above zero. It sets the
 order stepper to HERO_SMS_ORDER_COUNT (default 3, maximum 10) and clicks Buy
 once, so that one click orders every number. Numbers are saved under that
-email in kka_orders.json. get_code opens a new TARGET_URL3/purchases/numbers
+email in kka_orders.json. get_code opens a new SERVICE_URL2/purchases/numbers
 page, waits up to 5 minutes for an OTP on the matching row, and closes that
 page when it returns. code_passed clicks complete activation on the row whose
 code was read, cancels the other rows for that email, and deletes those saved
@@ -18,7 +18,7 @@ numbers.
 
 Calls wait in one queue so the browser does one thing at a time.
 
-Requires HERO_SMS_EMAIL and HERO_SMS_PASSWORD in .env, plus TARGET_URL3.
+Requires HERO_SMS_EMAIL and HERO_SMS_PASSWORD in .env, plus SERVICE_URL2.
 Listens on HERO_SMS_PORT (default 8781) so it can run beside the other number service.
 """
 
@@ -67,7 +67,7 @@ def load_env(path: Path) -> None:
 
 
 load_env(ENV_FILE)
-BASE_URL = os.environ.get("TARGET_URL3", "").strip().rstrip("/")
+BASE_URL = os.environ.get("SERVICE_URL2", "").strip().rstrip("/")
 PURCHASES_URL = urllib.parse.urljoin(f"{BASE_URL}/", "purchases/numbers") if BASE_URL else ""
 HERO_SMS_EMAIL = os.environ.get("HERO_SMS_EMAIL", "").strip()
 HERO_SMS_PASSWORD = os.environ.get("HERO_SMS_PASSWORD", "").strip()
@@ -612,7 +612,7 @@ class Dashboard:
 
     def open_purchases(self, fresh: bool = False) -> None:
         if not PURCHASES_URL:
-            raise SmsError("Set TARGET_URL3 in the environment")
+            raise SmsError("Set SERVICE_URL2 in the environment")
         self.ensure_browser()
         self._remember_buy_page()
         if fresh and self.purchases_page_id:
@@ -649,7 +649,7 @@ class Dashboard:
 
     def open_code_page(self) -> str:
         if not PURCHASES_URL:
-            raise SmsError("Set TARGET_URL3 in the environment")
+            raise SmsError("Set SERVICE_URL2 in the environment")
         self.ensure_browser()
         self._remember_buy_page()
         log(f"Opening a new page {PURCHASES_URL}")
@@ -2154,7 +2154,7 @@ def listen() -> ServiceServer:
 
 def main() -> None:
     if not BASE_URL.startswith("http"):
-        raise SystemExit(f"Set TARGET_URL3 in {ENV_FILE}")
+        raise SystemExit(f"Set SERVICE_URL2 in {ENV_FILE}")
     if not HERO_SMS_EMAIL or not HERO_SMS_PASSWORD:
         raise SystemExit(f"Set HERO_SMS_EMAIL and HERO_SMS_PASSWORD in {ENV_FILE}")
     if not 1 <= HERO_SMS_PORT <= 65535 or not 1 <= DEBUG_PORT <= 65535:
