@@ -8,13 +8,13 @@ Keeps one browser signed in to the number dashboard and serves three calls:
 
 `type` is `gmx` or `webde`. Each get_started types SMS_CODE_ORDER_COUNT into
 the quantity field, clicks Create Order once, waits 5 seconds, and saves the
-new numbers under that email in sms_orders.json. get_code opens a new page,
-waits up to 5 minutes for an OTP, and closes that page when it returns.
-code_passed clicks Done, or Cancel when Done is still disabled, then
-deletes the saved phone numbers for that email.
+new numbers under that email in sms_orders.json. Each get_code opens its own
+page immediately, waits up to 5 minutes for an OTP, and closes that page when
+it returns. code_passed clicks Done, or Cancel when Done is still disabled,
+then deletes the saved phone numbers for that email.
 
 Several get_started calls at once wait in a queue and run one after another.
-get_code and code_passed use that same queue so they do not interrupt an order.
+get_code does not wait in that queue: every lookup opens a page of its own.
 
 Requires SMS_CODE_EMAIL and SMS_CODE_PASSWORD in .env, plus TARGET_URL2.
 """
@@ -159,6 +159,7 @@ class SmsError(Exception):
 class OrderStore:
     def __init__(self, path: Path):
         self.path = path
+        self._lock = threading.RLock()
         self.data = {"emails": {}, "phones": {}}
         if not path.is_file():
             return
@@ -181,6 +182,10 @@ class OrderStore:
         temp.replace(self.path)
 
     def add(self, email: str, kind: str, phone: str, order_id: str, product_id: str) -> None:
+        with self._lock:
+            self._add(email, kind, phone, order_id, product_id)
+
+    def _add(self, email: str, kind: str, phone: str, order_id: str, product_id: str) -> None:
         key = digits(phone) or f"order:{order_id}"
         entry = self.data["emails"].setdefault(email, {"type": kind, "phones": []})
         entry["type"] = kind
@@ -199,6 +204,10 @@ class OrderStore:
         self.save()
 
     def phones_for(self, email: str) -> list[dict]:
+        with self._lock:
+            return self._phones_for(email)
+
+    def _phones_for(self, email: str) -> list[dict]:
         entry = self.data["emails"].get(email) or {}
         found = []
         for key in entry.get("phones") or []:
@@ -208,11 +217,18 @@ class OrderStore:
         return found
 
     def find_phone(self, phone: str) -> dict | None:
-        record = self.data["phones"].get(digits(phone))
-        return record if isinstance(record, dict) else None
+        with self._lock:
+            record = self.data["phones"].get(digits(phone))
+            return dict(record) if isinstance(record, dict) else None
 
     def mark(self, phone: str, order_id: str, status: str) -> None:
-        record = self.find_phone(phone) if phone else None
+        with self._lock:
+            self._mark(phone, order_id, status)
+
+    def _mark(self, phone: str, order_id: str, status: str) -> None:
+        record = self.data["phones"].get(digits(phone)) if phone else None
+        if not isinstance(record, dict):
+            record = None
         if record is None:
             for item in self.data["phones"].values():
                 if isinstance(item, dict) and str(item.get("order_id") or "") == order_id:
@@ -224,6 +240,10 @@ class OrderStore:
         self.save()
 
     def remove_email(self, email: str) -> list[str]:
+        with self._lock:
+            return self._remove_email(email)
+
+    def _remove_email(self, email: str) -> list[str]:
         entry = self.data["emails"].pop(email, None)
         keys = []
         if isinstance(entry, dict):
@@ -420,9 +440,8 @@ class Dashboard:
     def __init__(self):
         self.cdp: Cdp | None = None
         self.socket: CdpSocket | None = None
-        self._saved_cdp: Cdp | None = None
-        self._saved_socket: CdpSocket | None = None
         self._tab_id = ""
+        self._launch_lock = threading.Lock()
         self.proc: subprocess.Popen | None = None
         self.login_url = BASE_URL + "/auth/login"
         self.dashboard_url = BASE_URL + "/dashboard"
@@ -434,13 +453,23 @@ class Dashboard:
         finally:
             ws.close()
 
-    def open_tab(self, url: str) -> str:
-        self.ensure_browser()
-        created = self._browser_call("Target.createTarget", {"url": url})
+    def _ensure_process(self) -> None:
+        if port_open(DEBUG_PORT):
+            return
+        with self._launch_lock:
+            if port_open(DEBUG_PORT):
+                return
+            self.launch()
+            if self.cdp is None:
+                self.attach()
+
+    def spawn_lookup(self, number: str) -> Dashboard:
+        self._ensure_process()
+        created = self._browser_call("Target.createTarget", {"url": self.dashboard_url})
         target_id = str(created.get("targetId") or "")
         if not target_id:
             raise SmsError("Could not open a new page")
-        log("Opened a new page for the code lookup")
+        log(f"Opened a new page for {number}")
         deadline = time.time() + 20
         page = None
         while time.time() < deadline:
@@ -453,24 +482,28 @@ class Dashboard:
             if page:
                 break
             time.sleep(0.3)
+        lookup = Dashboard()
+        lookup.proc = self.proc
+        lookup._tab_id = target_id
         if not page:
+            lookup.close_lookup()
+            raise SmsError("New page did not appear")
+        try:
+            lookup.socket = CdpSocket(str(page["webSocketDebuggerUrl"]))
+            lookup.cdp = Cdp(lookup.socket)
             try:
-                self._browser_call("Target.closeTarget", {"targetId": target_id})
+                lookup._browser_call("Target.activateTarget", {"targetId": target_id})
             except (OSError, RuntimeError, TimeoutError):
                 pass
-            raise SmsError("New page did not appear")
-        self._saved_socket = self.socket
-        self._saved_cdp = self.cdp
-        self.socket = None
-        self.cdp = None
-        self._tab_id = target_id
-        try:
-            self.socket = CdpSocket(str(page["webSocketDebuggerUrl"]))
-            self.cdp = Cdp(self.socket)
-            self._browser_call("Target.activateTarget", {"targetId": target_id})
-        except (OSError, RuntimeError, TimeoutError):
-            self.close_tab()
+            lookup._wait_until_loaded()
+        except Exception:
+            lookup.close_lookup()
             raise
+        if "/auth/login" in lookup.href() or not lookup.wait_css("button.pill", 8):
+            lookup.login()
+        return lookup
+
+    def _wait_until_loaded(self) -> None:
         deadline = time.time() + 30
         while time.time() < deadline:
             try:
@@ -481,22 +514,14 @@ class Dashboard:
             state, _, current = value.partition("\n")
             if state == "complete" and current and not current.startswith("about:"):
                 self.install_hooks()
-                return target_id
+                return
             time.sleep(0.4)
         self.install_hooks()
-        return target_id
 
-    def close_tab(self) -> None:
+    def close_lookup(self) -> None:
         target_id = self._tab_id
-        saved_socket = self._saved_socket
-        saved_cdp = self._saved_cdp
         self._tab_id = ""
-        self._saved_socket = None
-        self._saved_cdp = None
-        if self.socket is not None and self.socket is not saved_socket:
-            self._drop_socket()
-        self.socket = saved_socket
-        self.cdp = saved_cdp
+        self._drop_socket()
         if not target_id:
             return
         try:
@@ -1123,44 +1148,43 @@ class SmsService:
         number = digits(phone)
         if len(number) < 6:
             raise ValueError("phone is invalid")
-        return self._submit(f"get_code {number}", lambda number=number: self._get_code(number))
-
-    def _get_code(self, number: str) -> dict:
-        record = self.store.find_phone(number)
-        kind = str((record or {}).get("type") or "gmx")
-        order_id = str((record or {}).get("order_id") or "")
+        record = self.store.find_phone(number) or {}
+        kind = str(record.get("type") or "gmx")
+        order_id = str(record.get("order_id") or "")
         try:
             kind = normalize_type(kind)
         except ValueError:
             kind = "gmx"
-        self.browser.ensure_session()
-        self.browser.open_tab(self.browser.dashboard_url)
+        page = self.browser.spawn_lookup(number)
         try:
-            deadline = time.monotonic() + OTP_WAIT_SECONDS
-            next_reload = 0.0
-            while time.monotonic() < deadline:
-                if time.monotonic() >= next_reload:
-                    try:
-                        self.browser.goto(self.browser.dashboard_url)
-                        self.browser.select_provider(kind)
-                    except (SmsError, RuntimeError, TimeoutError, OSError) as exc:
-                        log(f"Could not refresh the dashboard: {exc}")
-                    next_reload = time.monotonic() + 15
-                code, found_id = self._read_code(number, order_id)
-                if found_id:
-                    order_id = found_id
-                if code:
-                    log(f"OTP for {number} is {code}")
-                    return {"ok": True, "phone": number, "code": code, "order_id": order_id}
-                time.sleep(2)
-            log(f"No OTP for {number} within 5 minutes")
-            return {"ok": False, "error": "failed", "phone": number, "order_id": order_id}
+            return self._get_code(page, number, kind, order_id)
         finally:
-            self.browser.close_tab()
+            page.close_lookup()
 
-    def _read_code(self, number: str, order_id: str) -> tuple[str, str]:
+    def _get_code(self, page: Dashboard, number: str, kind: str, order_id: str) -> dict:
+        deadline = time.monotonic() + OTP_WAIT_SECONDS
+        next_reload = 0.0
+        while time.monotonic() < deadline:
+            if time.monotonic() >= next_reload:
+                try:
+                    page.goto(page.dashboard_url)
+                    page.select_provider(kind)
+                except (SmsError, RuntimeError, TimeoutError, OSError) as exc:
+                    log(f"Could not refresh the code page for {number}: {exc}")
+                next_reload = time.monotonic() + 15
+            code, found_id = self._read_code(page, number, order_id)
+            if found_id:
+                order_id = found_id
+            if code:
+                log(f"OTP for {number} is {code}")
+                return {"ok": True, "phone": number, "code": code, "order_id": order_id}
+            time.sleep(2)
+        log(f"No OTP for {number} within 5 minutes")
+        return {"ok": False, "error": "failed", "phone": number, "order_id": order_id}
+
+    def _read_code(self, page: Dashboard, number: str, order_id: str) -> tuple[str, str]:
         try:
-            cards = self.browser.cards()
+            cards = page.cards()
         except (RuntimeError, TimeoutError, OSError):
             return "", order_id
         matches = [card for card in cards if same_phone(card["phone"], number)]
