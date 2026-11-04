@@ -9,8 +9,9 @@ Keeps one browser signed in and serves three calls:
 `type` is `gmx` or `webde`. Each get_started searches that service, chooses
 Germany, and buys the cheapest price whose stock is above zero. It sets the
 order stepper to HERO_SMS_ORDER_COUNT (default 3, maximum 10) and clicks Buy
-once, so that one click orders every number. Numbers are saved under that
-email in kka_orders.json. get_code opens a new SERVICE_URL2/purchases/numbers
+once, so that one click orders every number. The new numbers are the top rows
+on the purchases page that were not listed before the click. They are saved
+under that email in kka_orders.json. get_code opens a new SERVICE_URL2/purchases/numbers
 page, waits up to 5 minutes for an OTP on the matching row, and closes that
 page when it returns. code_passed clicks complete activation on the row whose
 code was read, cancels the other rows for that email, and deletes those saved
@@ -172,16 +173,6 @@ def order_count(override: int | None = None) -> int:
     if override < 1 or override > 10:
         raise ValueError("count must be from 1 to 10")
     return override
-
-
-def clock_distance(text: str, now: datetime.datetime | None = None) -> int:
-    match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", text or "")
-    if not match:
-        return 24 * 60
-    current = now or datetime.datetime.now()
-    then = int(match.group(1)) * 60 + int(match.group(2))
-    diff = abs(current.hour * 60 + current.minute - then)
-    return min(diff, 24 * 60 - diff)
 
 
 class SmsError(Exception):
@@ -1678,9 +1669,20 @@ class Dashboard:
                 log(f"Could not return to the order page: {exc}")
         return {key for key in keys if key}
 
+    def top_new_rows(self, rows: list[dict], seen: set[str], count: int) -> list[dict]:
+        fresh = []
+        for row in rows:
+            key = self.row_key(row)
+            if not key or key in seen or any(same_phone(key, old) for old in seen):
+                continue
+            fresh.append(row)
+            if len(fresh) >= count:
+                break
+        return fresh
+
     def new_purchase_rows(self, before: set[str], count: int) -> list[dict]:
         found: list[dict] = []
-        seen = set(before)
+        logged: set[str] = set()
         try:
             self.open_purchases()
         except (SmsError, RuntimeError, TimeoutError, OSError) as exc:
@@ -1694,16 +1696,14 @@ class Dashboard:
                     rows = self.list_rows()
                 except (RuntimeError, TimeoutError, OSError):
                     rows = []
-                for row in rows:
-                    if len(found) >= count:
-                        break
+                found = []
+                for row in self.top_new_rows(rows, before, count):
                     key = self.row_key(row)
-                    if not key or len(key) < 10 or key in seen:
+                    if not key or len(key) < 10:
                         continue
                     phone = plus_phone(key)
                     if not phone:
                         continue
-                    seen.add(key)
                     found.append(
                         {
                             "phone": phone,
@@ -1711,7 +1711,9 @@ class Dashboard:
                             "price": row.get("price") or "",
                         }
                     )
-                    log(f"New number {phone}")
+                    if key not in logged:
+                        logged.add(key)
+                        log(f"New number {phone}")
                 if len(found) >= count or time.time() >= deadline:
                     break
                 if not reloaded and time.time() > deadline - 25:

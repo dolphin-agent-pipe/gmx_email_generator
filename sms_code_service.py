@@ -8,7 +8,7 @@ Keeps one browser signed in to the number dashboard and serves three calls:
 
 `type` is `gmx` or `webde`. Each get_started types SMS_CODE_ORDER_COUNT into
 the quantity field, clicks Create Order once, waits 5 seconds, and saves the
-new numbers under that email in sms_orders.json. Each get_code opens its own
+top new numbers under that email in sms_orders.json. Each get_code opens its own
 page immediately, waits up to 5 minutes for an OTP, and closes that page when
 it returns. code_passed clicks Done, or Cancel when Done is still disabled,
 then deletes the saved phone numbers for that email.
@@ -936,10 +936,18 @@ class Dashboard:
             time.sleep(0.35)
         return last
 
-    def _fresh_cards(self, before: set[str], product_id: str) -> list[dict]:
-        fresh = [card for card in self.cards() if card["order_id"] not in before]
-        matched = [card for card in fresh if card["product_id"] == product_id]
-        return matched or fresh
+    def _fresh_cards(self, before: set[str], product_id: str, count: int) -> list[dict]:
+        fresh = []
+        for card in self.cards():
+            if not card.get("order_id") or card["order_id"] in before:
+                continue
+            fresh.append(card)
+            if len(fresh) >= count:
+                break
+        matched = [card for card in fresh if card["product_id"] == product_id and card.get("phone")]
+        if matched:
+            return matched
+        return [card for card in fresh if card.get("phone")]
 
     def attempt_order(self, product_id: str, count: int) -> dict:
         before = self.known_order_ids()
@@ -991,7 +999,7 @@ class Dashboard:
         time.sleep(5)
         try:
             state = self.order_state()
-            created = [card for card in self._fresh_cards(before, product_id) if card["phone"]]
+            created = self._fresh_cards(before, product_id, count)
         except (RuntimeError, TimeoutError, OSError):
             state = {"error_shown": False, "error_text": "", "loading": False}
             created = []
@@ -1004,7 +1012,7 @@ class Dashboard:
         deadline = time.time() + ORDER_WAIT_SECONDS
         while time.time() < deadline:
             try:
-                created = [card for card in self._fresh_cards(before, product_id) if card["phone"]]
+                created = self._fresh_cards(before, product_id, count)
                 state = self.order_state()
             except (RuntimeError, TimeoutError, OSError):
                 time.sleep(0.4)
