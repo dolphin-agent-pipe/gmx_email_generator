@@ -87,7 +87,7 @@ class DolphinAPI:
         self.s = requests.Session()
         self.s.headers.update({
             'Accept': 'application/json, text/plain, */*',
-            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Encoding': 'gzip, deflate',
             'Accept-Language': 'ru',
             'User-Agent': f'dolphin_anty_{self._get_latest_release()}_Windows_NT',
             'Referer': 'https://app.dolphin-anty-ru.online/',
@@ -97,13 +97,21 @@ class DolphinAPI:
             self._collect_garbage()
 
     def _error_text(self, response):
+        encoding = (response.headers.get("Content-Encoding") or "").lower()
+        if encoding and encoding not in {"gzip", "deflate", "identity"}:
+            return f"HTTP {response.status_code} ({encoding} body was not decoded)"
+        raw = response.content or b""
+        if raw and not raw[:1].isascii():
+            return f"HTTP {response.status_code} (response was not text)"
         text = (response.text or "").strip()
         if text.startswith("<"):
             title = re.search(r"<title>([^<]+)</title>", text, re.I)
             if title:
                 return f"HTTP {response.status_code} {title.group(1).strip()}"
             return f"HTTP {response.status_code} (HTML error page)"
-        return text or f"HTTP {response.status_code}"
+        if text and sum(ch.isprintable() or ch.isspace() for ch in text) < len(text) * 0.9:
+            return f"HTTP {response.status_code} (response was not text)"
+        return text[:500] or f"HTTP {response.status_code}"
 
     def _request_json(self, method, url, **kwargs):
         timeout = kwargs.pop("timeout", 60)

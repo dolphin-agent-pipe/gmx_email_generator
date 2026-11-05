@@ -1275,6 +1275,7 @@ class SmsService:
 
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     service: SmsService
 
     def log_message(self, fmt: str, *args) -> None:
@@ -1331,11 +1332,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, payload: dict, status: int) -> None:
         body = json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            self.close_connection = True
 
 
 class ServiceServer(ThreadingHTTPServer):

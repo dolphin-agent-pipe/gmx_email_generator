@@ -94,8 +94,9 @@ def load_store() -> None:
     if isinstance(history, list):
         state["history"] = [item for item in history if isinstance(item, dict)]
     for row in state["rows"]:
-        if row.get("status") == "running":
+        if row.get("status") in {"running", "queued"}:
             row["status"] = "ready"
+            row["cancel"] = False
             row["detail"] = "Interrupted. Start again."
 
 
@@ -199,15 +200,56 @@ def service_email(row: dict, kind: str) -> str:
     return f"{local}@{domain}"
 
 
+class RowCancelled(Exception):
+    pass
+
+
+def console(row: dict, detail: str) -> None:
+    name = f"{row.get('first', '')} {row.get('last', '')}".strip() or row.get("id", "")
+    print(f"[{name}] {detail}", flush=True)
+
+
 def set_detail(row: dict, detail: str) -> None:
+    console(row, detail)
     with state_lock:
         row["detail"] = detail
         save_store()
 
 
-def finish_numbers(provider: str, email: str) -> None:
+def row_cancelled(row: dict) -> bool:
+    with state_lock:
+        return bool(row.get("cancel"))
+
+
+def ensure_active(row: dict) -> None:
+    if row_cancelled(row):
+        raise RowCancelled()
+
+
+def call_service(row: dict, base: str, path: str, body: dict | None, timeout: float) -> dict:
+    box: dict = {}
+
+    def work() -> None:
+        try:
+            box["result"] = request_json(base, path, body, timeout=timeout)
+        except Exception as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=work, name="studio-request", daemon=True)
+    thread.start()
+    while thread.is_alive():
+        ensure_active(row)
+        thread.join(0.4)
+    if "error" in box:
+        raise box["error"]
+    return box.get("result") or {}
+
+
+def finish_numbers(provider: str, email: str, row: dict) -> None:
     try:
-        request_json(PROVIDERS[provider]["base"], "/code_passed", {"email": email}, timeout=180)
+        call_service(row, PROVIDERS[provider]["base"], "/code_passed", {"email": email}, 180)
+    except RowCancelled:
+        raise
     except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
         set_detail_by_email(email, f"Could not close numbers: {exc}")
 
@@ -231,13 +273,16 @@ def run_row(row: dict, provider: str, kind: str) -> None:
         row["service_email"] = email_key
         row["detail"] = "Ordering numbers"
         save_store()
+    console(row, "Ordering numbers")
     ordered = False
     try:
-        started = request_json(
+        ensure_active(row)
+        started = call_service(
+            row,
             PROVIDERS[provider]["base"],
             "/get_started",
             {"email": email_key, "type": kind},
-            timeout=240,
+            240,
         )
         phones = phone_values(started)
         if not started.get("ok") or not phones:
@@ -246,20 +291,21 @@ def run_row(row: dict, provider: str, kind: str) -> None:
         set_detail(row, f"{len(phones)} numbers ready")
 
         def fetch_code(phone: str) -> str:
+            ensure_active(row)
             with state_lock:
                 row["phone"] = phone
                 row["detail"] = f"Waiting for SMS on {phone}"
                 save_store()
-            payload = request_json(
-                PROVIDERS[provider]["base"],
-                "/get_code",
-                {"phone": phone},
-                timeout=360,
-            )
+            console(row, f"Waiting for SMS on {phone}")
+            payload = call_service(row, PROVIDERS[provider]["base"], "/get_code", {"phone": phone}, 360)
             return str(payload.get("code") or "") if payload.get("ok") else ""
 
         def log(message: str) -> None:
+            ensure_active(row)
             set_detail(row, message)
+
+        def stop() -> None:
+            ensure_active(row)
 
         url = WEBDE_URL if kind == "webde" else GMX_URL
         profile = re.sub(r"[^A-Za-z0-9._-]+", "-", f"{row['first']}-{row['last']}").strip("-") or row["id"]
@@ -279,6 +325,7 @@ def run_row(row: dict, provider: str, kind: str) -> None:
             phones,
             fetch_code,
             log=log,
+            stop=stop,
         )
         created = now_stamp()
         with state_lock:
@@ -301,59 +348,124 @@ def run_row(row: dict, provider: str, kind: str) -> None:
                 },
             )
             save_store()
+        console(row, f"Mailbox created: {mailbox}")
+    except RowCancelled:
+        console(row, "Cancelled")
+        with state_lock:
+            row["status"] = "ready"
+            row["cancel"] = False
+            row["detail"] = "Cancelled"
+            save_store()
     except (NoPhonesLeft, SystemExit, OSError, urllib.error.URLError, TimeoutError, RuntimeError, ValueError) as exc:
         message = str(getattr(exc, "code", "") or exc).strip() or "Generation failed"
         with state_lock:
             row["status"] = "failed"
             row["detail"] = message[:300]
+            row["cancel"] = False
             save_store()
+        console(row, row["detail"])
     except Exception as exc:
         traceback.print_exc()
         with state_lock:
             row["status"] = "failed"
+            row["cancel"] = False
             row["detail"] = str(exc)[:300] or "Generation failed"
             save_store()
+        console(row, row["detail"])
     finally:
         if ordered:
-            finish_numbers(provider, email_key)
+            try:
+                finish_numbers(provider, email_key, row)
+            except RowCancelled:
+                pass
 
 
-def worker_loop(provider: str, kind: str) -> None:
+def worker_loop() -> None:
     try:
         while True:
             with state_lock:
-                row = next((item for item in state["rows"] if item.get("status") == "ready"), None)
-            if row is None:
-                return
-            run_row(row, provider, kind)
-    finally:
+                row = next((item for item in state["rows"] if item.get("status") == "queued"), None)
+                if row is None:
+                    state["running"] = False
+                    save_store()
+                    return
+            if row_cancelled(row):
+                with state_lock:
+                    row["status"] = "ready"
+                    row["cancel"] = False
+                    row["detail"] = "Cancelled"
+                    save_store()
+                console(row, "Cancelled")
+                continue
+            run_row(row, str(row.get("provider") or ""), str(row.get("kind") or "gmx"))
+    except Exception:
+        traceback.print_exc()
         with state_lock:
             state["running"] = False
             save_store()
 
 
-def start_batch(provider: str, kind: str) -> dict:
+def ensure_worker() -> None:
     global worker
+    if worker is not None and worker.is_alive():
+        return
+    worker = threading.Thread(target=worker_loop, name="studio-batch", daemon=True)
+    worker.start()
+
+
+def start_rows(provider: str, kind: str, ids: list[str]) -> dict:
     if provider not in PROVIDERS:
         raise ValueError("Choose one number service")
     if kind not in {"gmx", "webde"}:
         raise ValueError("Mailbox type must be gmx or webde")
+    wanted = {str(item) for item in ids if str(item).strip()}
+    if not wanted:
+        raise RuntimeError("Select at least one row")
+    if not provider_up(provider):
+        label = PROVIDERS[provider]["label"]
+        base = PROVIDERS[provider]["base"]
+        raise RuntimeError(f"{label} is not running at {base}")
     with state_lock:
-        if state["running"]:
-            raise RuntimeError("A batch is already running")
-        ready = [row for row in state["rows"] if row.get("status") == "ready"]
-        if not ready:
-            raise RuntimeError("Import at least one complete row first")
-        if not provider_up(provider):
-            label = PROVIDERS[provider]["label"]
-            base = PROVIDERS[provider]["base"]
-            raise RuntimeError(f"{label} is not running at {base}")
+        queued = 0
+        for row in state["rows"]:
+            if row.get("id") not in wanted or row.get("status") not in {"ready", "failed"}:
+                continue
+            row["status"] = "queued"
+            row["cancel"] = False
+            row["provider"] = provider
+            row["kind"] = kind
+            row["detail"] = "Waiting"
+            queued += 1
+            console(row, f"Queued on {PROVIDERS[provider]['label']}")
+        if not queued:
+            raise RuntimeError("Select a row that is waiting or failed")
         state["running"] = True
         state["provider"] = provider
         state["kind"] = kind
         save_store()
-        worker = threading.Thread(target=worker_loop, args=(provider, kind), name="studio-batch", daemon=True)
-        worker.start()
+        ensure_worker()
+    return public_state()
+
+
+def cancel_row(row_id: str) -> dict:
+    with state_lock:
+        row = next((item for item in state["rows"] if item.get("id") == row_id), None)
+        if row is None:
+            raise ValueError("Row not found")
+        status = row.get("status")
+        if status == "queued":
+            row["status"] = "ready"
+            row["cancel"] = False
+            row["detail"] = "Cancelled"
+            save_store()
+            console(row, "Cancelled")
+        elif status == "running":
+            row["cancel"] = True
+            row["detail"] = "Cancelling"
+            save_store()
+            console(row, "Cancelling")
+        else:
+            raise RuntimeError("This row is not running")
     return public_state()
 
 
@@ -498,6 +610,13 @@ PAGE = r"""<!DOCTYPE html>
   .status.done i { background: #3dce8c; }
   .status.failed { color: #f3b0b4; }
   .status.failed i { background: #f07178; }
+  .status.queued { color: #b9ccff; }
+  .status.queued i { background: #6ea8ff; }
+  th.check, td.check { width: 42px; text-align: center; padding-left: 12px; padding-right: 8px; }
+  input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); }
+  .row-btn { height: 28px; padding: 0 10px; }
+  .row-btn.cancel { background: transparent; border-color: #6a3b3b; color: #f3b0b4; }
+  .row-btn.cancel:hover { background: #2a1c1e; }
   .empty {
     flex: 1;
     display: grid;
@@ -542,7 +661,7 @@ PAGE = r"""<!DOCTYPE html>
       <div class="actions">
         <button type="button" class="btn quiet" id="clear">Clear</button>
         <button type="button" class="btn" id="import-file">Import</button>
-        <button type="button" class="btn primary" id="start">Start</button>
+        <button type="button" class="btn primary" id="start-selected">Start selected</button>
       </div>
       <input id="file" type="file" accept=".txt,.csv,text/plain" class="hidden">
     </div>
@@ -556,7 +675,8 @@ PAGE = r"""<!DOCTYPE html>
       <table>
         <thead>
           <tr>
-            <th>Person</th><th>Address</th><th>Status</th><th>Phone</th><th>Email</th><th>Password</th><th>Progress</th>
+            <th class="check"><input id="pick-all" type="checkbox" aria-label="Select all"></th>
+            <th>Person</th><th>Address</th><th>Status</th><th>Phone</th><th>Email</th><th>Password</th><th>Progress</th><th></th>
           </tr>
         </thead>
         <tbody id="queue"></tbody>
@@ -589,6 +709,7 @@ const kind = document.querySelector("#kind");
 const queueBody = document.querySelector("#queue");
 const historyBody = document.querySelector("#history-body");
 let latest = {rows: [], history: [], running: false};
+const selected = new Set();
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
@@ -605,12 +726,28 @@ function textCell(value, cls) {
   return `<td class="${cls}" title="${esc(text)}">${esc(text)}</td>`;
 }
 
+function canStart(row) {
+  return row.status === "ready" || row.status === "failed";
+}
+
+function rowAction(row) {
+  if (row.status === "queued" || row.status === "running") {
+    return `<button type="button" class="btn row-btn cancel" data-act="cancel" data-id="${esc(row.id)}">Cancel</button>`;
+  }
+  if (row.status === "done") return "";
+  return `<button type="button" class="btn row-btn" data-act="start" data-id="${esc(row.id)}">Start</button>`;
+}
+
 function renderQueue() {
   const rows = latest.rows || [];
+  const known = new Set(rows.map((row) => row.id));
+  for (const id of [...selected]) if (!known.has(id)) selected.delete(id);
   queueBody.innerHTML = rows.map((row) => {
     const birth = [row.day, row.month, row.year].filter(Boolean).join(".");
     const place = [row.plz, row.city].filter(Boolean).join(" ");
+    const pickable = canStart(row);
     return `<tr>
+      <td class="check"><input class="pick" type="checkbox" value="${esc(row.id)}" ${selected.has(row.id) ? "checked" : ""} ${pickable ? "" : "disabled"}></td>
       <td><span class="who">${esc(row.first)} ${esc(row.last)}</span><span class="sub">${esc(birth)}</span></td>
       <td title="${esc(row.street)}"><span class="line">${esc(row.street)}</span><span class="sub">${esc(place)}</span></td>
       <td>${pill(row.status)}</td>
@@ -618,18 +755,26 @@ function renderQueue() {
       ${textCell(row.email, "mono")}
       ${textCell(row.password, "mono")}
       ${textCell(row.detail, "detail")}
+      <td>${rowAction(row)}</td>
     </tr>`;
   }).join("");
   document.querySelector("#queue-empty").classList.toggle("hidden", rows.length > 0);
   document.querySelector("#queue-wrap").classList.toggle("hidden", rows.length === 0);
   const counts = rows.reduce((sum, row) => { sum[row.status] = (sum[row.status] || 0) + 1; return sum; }, {});
-  document.querySelector("#summary").innerHTML = ["ready", "running", "done", "failed"]
+  document.querySelector("#summary").innerHTML = ["ready", "queued", "running", "done", "failed"]
     .filter((key) => counts[key])
     .map((key) => `<span><b>${counts[key]}</b> ${esc(key)}</span>`)
     .join("");
-  document.querySelector("#start").disabled = !!latest.running || !(counts.ready);
-  document.querySelector("#provider").disabled = !!latest.running;
-  document.querySelector("#kind").disabled = !!latest.running;
+  const startable = rows.filter((row) => canStart(row) && selected.has(row.id));
+  document.querySelector("#start-selected").disabled = startable.length === 0;
+  const pickable = rows.filter(canStart);
+  const pickAll = document.querySelector("#pick-all");
+  pickAll.checked = pickable.length > 0 && pickable.every((row) => selected.has(row.id));
+  pickAll.indeterminate = !pickAll.checked && pickable.some((row) => selected.has(row.id));
+  pickAll.disabled = pickable.length === 0;
+  const busy = rows.some((row) => row.status === "queued" || row.status === "running");
+  document.querySelector("#provider").disabled = busy;
+  document.querySelector("#kind").disabled = busy;
 }
 
 function filteredHistory() {
@@ -704,7 +849,34 @@ document.querySelector("#file").onchange = async (event) => {
   await act("/api/import", {text: await file.text()});
 };
 document.querySelector("#clear").onclick = () => act("/api/clear", {});
-document.querySelector("#start").onclick = () => act("/api/start", {provider: provider.value, kind: kind.value});
+document.querySelector("#start-selected").onclick = () => {
+  const ids = (latest.rows || []).filter((row) => canStart(row) && selected.has(row.id)).map((row) => row.id);
+  ids.forEach((id) => selected.delete(id));
+  act("/api/start", {provider: provider.value, kind: kind.value, ids});
+};
+document.querySelector("#pick-all").onchange = (event) => {
+  (latest.rows || []).filter(canStart).forEach((row) => {
+    if (event.target.checked) selected.add(row.id);
+    else selected.delete(row.id);
+  });
+  renderQueue();
+};
+queueBody.addEventListener("change", (event) => {
+  const box = event.target.closest("input.pick");
+  if (!box) return;
+  if (box.checked) selected.add(box.value);
+  else selected.delete(box.value);
+  renderQueue();
+});
+queueBody.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-act]");
+  if (!button) return;
+  if (button.dataset.act === "start") {
+    act("/api/start", {provider: provider.value, kind: kind.value, ids: [button.dataset.id]});
+    return;
+  }
+  if (button.dataset.act === "cancel") act("/api/cancel", {id: button.dataset.id});
+});
 document.querySelector("#filter-date").oninput = renderHistory;
 document.querySelector("#filter-query").oninput = renderHistory;
 refresh();
@@ -748,7 +920,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(public_state(), 200)
                 return
             if path == "/api/start":
-                self._send(start_batch(str(body.get("provider") or ""), str(body.get("kind") or "gmx")), 200)
+                raw_ids = body.get("ids") or []
+                if not isinstance(raw_ids, list):
+                    raise ValueError("ids must be a list")
+                self._send(start_rows(str(body.get("provider") or ""), str(body.get("kind") or "gmx"), [str(item) for item in raw_ids]), 200)
+                return
+            if path == "/api/cancel":
+                self._send(cancel_row(str(body.get("id") or "")), 200)
                 return
             if path == "/api/clear":
                 with state_lock:

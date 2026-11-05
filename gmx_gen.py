@@ -1684,7 +1684,7 @@ def fill_signup(
     return visible_mailbox(cdp, mailbox)
 
 
-def verify_supplied_phones(gmx: Cdp, phones: list[str], fetch_code, log=print) -> str:
+def verify_supplied_phones(gmx: Cdp, phones: list[str], fetch_code, log=print, stop=None) -> str:
     pending = [str(phone).strip() for phone in phones if str(phone).strip()]
     if not pending:
         raise NoPhonesLeft("No phone numbers were returned")
@@ -1694,7 +1694,11 @@ def verify_supplied_phones(gmx: Cdp, phones: list[str], fetch_code, log=print) -
         prefix, national = split_phone(number)
         deadline = time.time() + 25
         while time.time() < deadline and not element_box(gmx, "#mobilePhone"):
+            if stop:
+                stop()
             time.sleep(0.4)
+        if stop:
+            stop()
         if not element_box(gmx, "#mobilePhone"):
             raise SystemExit("Phone form did not appear")
         selected = select_option(gmx, "#mobilePhonePrefix", prefix)
@@ -1746,6 +1750,7 @@ def generate_mailbox(
     phones: list[str],
     fetch_code,
     log=print,
+    stop=None,
     proxies: Path | None = None,
     proxy_type: str = "http",
     headless: bool = False,
@@ -1770,7 +1775,9 @@ def generate_mailbox(
     used = {"phone": ""}
 
     def phone_step(cdp: Cdp) -> None:
-        used["phone"] = verify_supplied_phones(cdp, phones, fetch_code, log=log)
+        if stop:
+            stop()
+        used["phone"] = verify_supplied_phones(cdp, phones, fetch_code, log=log, stop=stop)
 
     proxy = load_random_proxy(proxies or (ROOT / "proxies.txt"))
     session = requests.Session()
@@ -1785,6 +1792,8 @@ def generate_mailbox(
         automation = start_profile(session, profile_id, headless)
         port = int(automation["port"])
         print(f"Started {profile} on port {port}")
+        if stop:
+            stop()
         log("Opening the signup form")
         ws, target_id = connect_page(port)
         cdp = Cdp(ws)

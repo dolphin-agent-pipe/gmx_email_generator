@@ -82,19 +82,28 @@ set "LOG=%CD%\logs\%NAME%.log"
 set "ERR=%CD%\logs\%NAME%.err.log"
 set "PIDFILE=%CD%\logs\%NAME%.pid"
 set "HEALTH=http://127.0.0.1:%PORT%/health"
-echo Starting %NAME%
-powershell -NoProfile -Command "$p = Start-Process -FilePath $env:PY -ArgumentList $env:SCRIPT -WorkingDirectory (Get-Location).Path -RedirectStandardOutput $env:LOG -RedirectStandardError $env:ERR -WindowStyle Hidden -PassThru; Set-Content -LiteralPath $env:PIDFILE -Value $p.Id -Encoding ascii"
-if errorlevel 1 exit /b 1
-if not exist "%PIDFILE%" exit /b 1
-set /p SERVICE_PID=<"%PIDFILE%"
+echo Starting %NAME%. Its log stays in that command window.
+start "%NAME%" /D "%CD%" cmd /k "%PY% %SCRIPT%"
 echo Waiting for %NAME%
-powershell -NoProfile -Command "$deadline = (Get-Date).AddSeconds(120); $url = $env:HEALTH; $script = $env:SCRIPT; while ((Get-Date) -lt $deadline) { try { $r = Invoke-WebRequest -UseBasicParsing $url -TimeoutSec 3; if ($r.StatusCode -eq 200) { exit 0 } } catch {} ; $alive = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($script) }; if (-not $alive) { exit 2 }; Start-Sleep -Milliseconds 500 }; exit 1"
-if errorlevel 1 (
-  echo %NAME% did not stay running.
-  if exist "%ERR%" type "%ERR%"
-  if exist "%LOG%" type "%LOG%"
+set /a WAITED=0
+
+:wait_ready
+curl.exe -fsS --max-time 3 -o NUL "%HEALTH%" >nul 2>&1
+if not errorlevel 1 goto service_ready
+powershell -NoProfile -Command "if (Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'python' -and $_.CommandLine -and $_.CommandLine.Contains($env:SCRIPT) }) { exit 0 } else { exit 2 }"
+if errorlevel 2 (
+  echo %NAME% did not stay running. See its command window.
   exit /b 1
 )
+set /a WAITED+=1
+if %WAITED% GEQ 120 (
+  echo %NAME% did not become ready. See its command window.
+  exit /b 1
+)
+timeout /t 1 /nobreak >nul
+goto wait_ready
+
+:service_ready
 echo %NAME% is ready
 exit /b 0
 
