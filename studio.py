@@ -5,7 +5,7 @@ finished mailboxes.
 
     python studio.py
 
-Then open http://127.0.0.1:8790. Start the chosen number service first
+That opens the desktop window. Start the chosen number service first
 (sms_code_service, hero_sms_service, or anosim_service). Only one provider
 is used for a batch.
 
@@ -794,12 +794,26 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     load_store()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"Mailbox studio at http://{HOST}:{PORT}", flush=True)
+    threading.Thread(target=server.serve_forever, name="studio-http", daemon=True).start()
+    url = f"http://127.0.0.1:{PORT}"
+    print(f"Mailbox window at {url}", flush=True)
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("Stopped", flush=True)
+        import webview
+    except ImportError as exc:
+        raise SystemExit("Install the window library with: pip install pywebview") from exc
+    webview.create_window(
+        "Mailbox",
+        url,
+        width=1280,
+        height=820,
+        min_size=(980, 640),
+        background_color="#0c0e12",
+        text_select=True,
+    )
+    try:
+        webview.start()
     finally:
+        server.shutdown()
         server.server_close()
 
 
