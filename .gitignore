@@ -15,3 +15,5 @@ anosim_orders.json
 anosim_orders.json.tmp
 anosim_browser/
 studio_queue.json
+.venv/
+logs/
