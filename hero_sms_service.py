@@ -796,7 +796,7 @@ class Dashboard:
         if self.click_label("Accept all cookies"):
             actions.append("cookies")
             log("Accepted cookies")
-        if self.click_label("Remind me later"):
+        if self.click_text("Remind me later"):
             actions.append("later")
             log("Clicked Remind me later")
         return actions
@@ -817,6 +817,37 @@ class Dashboard:
         )
         value = self.evaluate(expression, timeout=10)
         return str(value or "unknown")
+
+    def click_text(self, label: str) -> bool:
+        expression = (
+            "(() => {"
+            + VISIBLE_FN
+            + f" const wanted = {json.dumps(label.lower())};"
+            " const textOf = (el) => (norm(el) + ' ' + (el.getAttribute('aria-label') || '')).replace(/\\s+/g, ' ').trim().toLowerCase();"
+            " const nodes = [];"
+            " const walk = (root) => {"
+            "   if (!root || !root.querySelectorAll) return;"
+            "   for (const el of root.querySelectorAll('button, a, [role=\"button\"], div, span')) {"
+            "     nodes.push(el);"
+            "     if (el.shadowRoot) walk(el.shadowRoot);"
+            "   }"
+            " };"
+            " walk(document);"
+            " const hits = nodes.filter((el) => visible(el) && textOf(el).includes(wanted));"
+            " hits.sort((a, b) => textOf(a).length - textOf(b).length);"
+            " const match = hits[0];"
+            " if (!match) return '';"
+            " const target = match.closest('button, a, [role=\"button\"]') || match;"
+            " target.scrollIntoView({block: 'center', inline: 'center'});"
+            " target.click();"
+            " return norm(target) || norm(match);"
+            "})()"
+        )
+        try:
+            value = str(self.evaluate(expression, timeout=10) or "")
+        except (RuntimeError, TimeoutError, OSError):
+            return False
+        return bool(value)
 
     def click_label(self, label: str, submit: bool = False) -> bool:
         expression = (
@@ -1771,7 +1802,15 @@ class Dashboard:
             + " const labels = ['Confirm', 'Yes', 'Cancel number', 'Yes, cancel'];"
             " const dialogs = [...document.querySelectorAll('[role=dialog], .modal, .info-modal')].filter(visible);"
             " for (const dialog of dialogs) {"
-            "   if (norm(dialog).includes('Protect your account')) continue;"
+            "   if (norm(dialog).toLowerCase().includes('protect your account') || norm(dialog).toLowerCase().includes('remind me later')) {"
+            "     const later = [...dialog.querySelectorAll('button, a, [role=button], span, div')].filter(visible)"
+            "       .sort((a, b) => norm(a).length - norm(b).length)"
+            "       .find((el) => norm(el).toLowerCase().includes('remind me later'));"
+            "     const target = later && (later.closest('button, a, [role=button]') || later);"
+            "     if (!target) continue;"
+            "     target.click();"
+            "     return 'Remind me later';"
+            "   }"
             "   const button = [...dialog.querySelectorAll('button')].find((el) => visible(el) && labels.includes(norm(el)) && !el.disabled);"
             "   if (!button) continue;"
             "   button.click();"

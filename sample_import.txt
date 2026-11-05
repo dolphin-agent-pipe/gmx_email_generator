@@ -1,0 +1,21 @@
+first;last;day;month;year;plz;city;street;password
+Lena;Hoffmann;12;3;1991;80331;Muenchen;Sendlinger Str. 8;RoteWelle27?Haus
+Jonas;Keller;2;8;1994;10115;Berlin;Invalidenstr. 12;BlauFeld18!Haus
+Mara;Vogel;21;11;1989;20095;Hamburg;Moenckebergstr. 5;HafenLicht44#Tor
+Erik;Bauer;7;1;1996;50667;Koeln;Schildergasse 31;DomPlatz09&Weg
+Nora;Schneider;15;6;1992;60311;Frankfurt;Zeil 44;MainUfer63!Platz
+Tim;Wagner;28;4;1988;70173;Stuttgart;Koenigstr. 18;Schloss7?Garten
+Lea;Fischer;9;9;1997;04109;Leipzig;Petersstr. 22;MarktLicht15#Haus
+Paul;Weber;3;12;1990;01067;Dresden;Altmarkt 6;ElbeBlick28&Tor
+Emma;Schulz;19;2;1993;28195;Bremen;Obernstr. 14;WeserWind41!Haus
+Felix;Koch;11;7;1987;30159;Hannover;Georgstr. 9;LeinePark36?Weg
+Mia;Richter;25;5;1995;90402;Nuernberg;Karolinenstr. 3;BurgTor52#Haus
+Leon;Klein;8;10;1991;45127;Essen;Kettwiger Str. 17;RuhrLicht19&Tor
+Clara;Wolf;14;3;1998;44135;Dortmund;Westenhellweg 11;WestPark27!Haus
+Ben;Neumann;30;8;1986;40210;Duesseldorf;Schadowstr. 21;RheinBlick64?Weg
+Ida;Schwarz;6;4;1994;68159;Mannheim;Planken 8;NeckarHaus33#Tor
+Max;Zimmermann;17;1;1989;76133;Karlsruhe;Kaiserstr. 26;Schloss22&Licht
+Sara;Krueger;23;9;1996;79098;Freiburg;Kaiser-Joseph-Str. 4;Dreisam15!Haus
+Noah;Hofmann;4;6;1992;86150;Augsburg;Annastr. 13;LechUfer48?Weg
+Emma;Hartmann;27;11;1988;65183;Wiesbaden;Kirchgasse 7;KurPark31#Haus
+Jonas;Lang;16;2;1997;24103;Kiel;Holstenstr. 19;FoerdeBlick56&Tor

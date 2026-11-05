@@ -793,7 +793,13 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     load_store()
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    try:
+        server = ThreadingHTTPServer((HOST, PORT), Handler)
+    except OSError as exc:
+        busy = getattr(exc, "winerror", None) in {10013, 10048} or exc.errno in {13, 48, 98}
+        if busy:
+            raise SystemExit(f"Mailbox is already open on port {PORT}.") from exc
+        raise
     threading.Thread(target=server.serve_forever, name="studio-http", daemon=True).start()
     url = f"http://127.0.0.1:{PORT}"
     print(f"Mailbox window at {url}", flush=True)
