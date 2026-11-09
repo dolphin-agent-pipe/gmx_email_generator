@@ -14,7 +14,7 @@ It then reads the new rows at the top of SERVICE_URL3/customer/dashboard and
 saves those numbers under the email in anosim_orders.json.
 
 get_code opens a new SERVICE_URL3/customer/dashboard page, finds the matching
-number, waits up to 5 minutes for an OTP in that row's "Last received SMS"
+number, waits up to 2 minutes for an OTP in that row's "Last received SMS"
 table, and closes that page when it returns. Each get_code uses its own page,
 so several lookups can run at once. code_passed clicks Done on the number
 whose code was read, cancels the other numbers for that email, and deletes
@@ -48,7 +48,7 @@ ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
 STORE_FILE = ROOT / "anosim_orders.json"
 PROFILE_DIR = ROOT / "anosim_browser"
-OTP_WAIT_SECONDS = 300
+OTP_WAIT_SECONDS = 120
 ORDER_WAIT_SECONDS = 45
 CLOSE_WAIT_SECONDS = 180
 DASHBOARD_REFRESH_SECONDS = 8
@@ -1470,7 +1470,7 @@ class NumberService:
             if time.monotonic() >= deadline:
                 break
             time.sleep(DASHBOARD_REFRESH_SECONDS)
-        log(f"No OTP for {number} within 5 minutes")
+        log(f"No OTP for {number} within 2 minutes")
         return {"ok": False, "error": "failed", "phone": plus_phone(number)}
 
     def code_passed(self, email: str) -> dict:

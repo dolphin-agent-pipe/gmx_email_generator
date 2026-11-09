@@ -12,7 +12,7 @@ order stepper to HERO_SMS_ORDER_COUNT (default 3, maximum 10) and clicks Buy
 once, so that one click orders every number. The new numbers are the top rows
 on the purchases page that were not listed before the click. They are saved
 under that email in kka_orders.json. get_code opens a new SERVICE_URL2/purchases/numbers
-page, waits up to 5 minutes for an OTP on the matching row, and closes that
+page, waits up to 2 minutes for an OTP on the matching row, and closes that
 page when it returns. code_passed clicks complete activation on the row whose
 code was read, cancels the other rows for that email, and deletes those saved
 numbers.
@@ -45,7 +45,7 @@ ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
 STORE_FILE = ROOT / "kka_orders.json"
 PROFILE_DIR = ROOT / "kka_browser"
-OTP_WAIT_SECONDS = 300
+OTP_WAIT_SECONDS = 120
 ORDER_WAIT_SECONDS = 30
 PURCHASES_REFRESH_SECONDS = 10
 CLOSE_WAIT_SECONDS = 180
@@ -2029,7 +2029,7 @@ class NumberService:
                     next_reload = time.monotonic() + PURCHASES_REFRESH_SECONDS
                 else:
                     time.sleep(1)
-            log(f"No OTP for {number} within 5 minutes")
+            log(f"No OTP for {number} within 2 minutes")
             return {"ok": False, "error": "failed", "phone": plus_phone(number)}
         finally:
             self.browser.close_code_page(target)

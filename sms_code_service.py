@@ -9,7 +9,7 @@ Keeps one browser signed in to the number dashboard and serves three calls:
 `type` is `gmx` or `webde`. Each get_started types SMS_CODE_ORDER_COUNT into
 the quantity field, clicks Create Order once, waits 5 seconds, and saves the
 top new numbers under that email in sms_orders.json. Each get_code opens its own
-page immediately, waits up to 5 minutes for an OTP, and closes that page when
+page immediately, waits up to 2 minutes for an OTP, and closes that page when
 it returns. code_passed clicks Done, or Cancel when Done is still disabled,
 then deletes the saved phone numbers for that email.
 
@@ -41,7 +41,7 @@ ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
 STORE_FILE = ROOT / "sms_orders.json"
 PROFILE_DIR = ROOT / "sms_browser"
-OTP_WAIT_SECONDS = 300
+OTP_WAIT_SECONDS = 120
 ORDER_WAIT_SECONDS = 30
 CLOSE_WAIT_SECONDS = 180
 PILL_IDS = {"webde": "99", "gmx": "97"}
@@ -1187,7 +1187,7 @@ class SmsService:
                 log(f"OTP for {number} is {code}")
                 return {"ok": True, "phone": number, "code": code, "order_id": order_id}
             time.sleep(2)
-        log(f"No OTP for {number} within 5 minutes")
+        log(f"No OTP for {number} within 2 minutes")
         return {"ok": False, "error": "failed", "phone": number, "order_id": order_id}
 
     def _read_code(self, page: Dashboard, number: str, order_id: str) -> tuple[str, str]:

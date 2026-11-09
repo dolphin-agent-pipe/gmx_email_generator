@@ -295,17 +295,84 @@ def maximize_window(cdp: Cdp, target_id: str = "") -> None:
             return
         cdp.call(
             "Browser.setWindowBounds",
+            {
+                "windowId": window_id,
+                "bounds": {"left": 40, "top": 40, "width": 1400, "height": 900, "windowState": "normal"},
+            },
+        )
+        cdp.call(
+            "Browser.setWindowBounds",
             {"windowId": window_id, "bounds": {"windowState": "maximized"}},
         )
+        try:
+            cdp.call("Page.bringToFront")
+        except (RuntimeError, TimeoutError):
+            pass
         print("Opened the browser at full width")
     except (RuntimeError, TimeoutError, OSError) as exc:
         print(f"Could not maximize the browser: {exc}")
 
 
+def show_profile_window(profile_id: str) -> None:
+    if os.name != "nt" or not profile_id:
+        return
+    import ctypes
+    import subprocess
+    from ctypes import wintypes
+
+    env = os.environ.copy()
+    env["PROFILE_ID"] = str(profile_id)
+    try:
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($env:PROFILE_ID) } | ForEach-Object { $_.ProcessId }",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    pids = {int(line) for line in completed.stdout.splitlines() if line.strip().isdigit()}
+    if not pids:
+        return
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.BringWindowToTop.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    chosen: list[tuple[int, int]] = []
+
+    def visit(hwnd, _lparam):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value not in pids:
+            return True
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
+        chosen.append((area, int(hwnd)))
+        return True
+
+    enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(visit)
+    user32.EnumWindows(enum_proc, 0)
+    if not chosen:
+        return
+    hwnd = wintypes.HWND(max(chosen)[1])
+    user32.ShowWindow(hwnd, 9)
+    user32.BringWindowToTop(hwnd)
+    user32.SetForegroundWindow(hwnd)
+    print("Brought the signup browser to the front")
+
+
 def start_profile(session: requests.Session, profile_id: str, headless: bool) -> dict:
-    query = "automation=1"
-    if headless:
-        query += "&headless=1"
+    query = "automation=1&headless=1" if headless else "automation=1&headless=0"
     url = f"{LOCAL_API}/v1.0/browser_profiles/{profile_id}/start?{query}"
     last_error = "start failed"
     for attempt in range(1, 4):
@@ -1804,6 +1871,7 @@ def generate_mailbox(
                 print(f"Could not focus the tab: {exc}")
         if not headless:
             maximize_window(cdp, target_id)
+            show_profile_window(profile_id)
         navigate(cdp, url)
         open_registration(cdp)
         mailbox = fill_signup(
@@ -1955,6 +2023,7 @@ def main() -> None:
                 print(f"Could not focus the tab: {exc}")
         if not args.headless:
             maximize_window(cdp, target_id)
+            show_profile_window(profile_id)
         navigate(cdp, args.url)
         open_registration(cdp)
         mailbox = fill_signup(
