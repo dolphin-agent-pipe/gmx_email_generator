@@ -263,7 +263,7 @@ def set_detail_by_email(email: str, detail: str) -> None:
 
 
 def run_row(row: dict, provider: str, kind: str) -> None:
-    from gmx_gen import NoPhonesLeft, generate_mailbox
+    from gmx_gen import NoPhonesLeft, SignupRestart, generate_mailbox
 
     email_key = service_email(row, kind)
     with state_lock:
@@ -276,57 +276,76 @@ def run_row(row: dict, provider: str, kind: str) -> None:
     console(row, "Ordering numbers")
     ordered = False
     try:
-        ensure_active(row)
-        started = call_service(
-            row,
-            PROVIDERS[provider]["base"],
-            "/get_started",
-            {"email": email_key, "type": kind},
-            240,
-        )
-        phones = phone_values(started)
-        if not started.get("ok") or not phones:
-            raise RuntimeError(str(started.get("error") or "The number service did not return a phone"))
-        ordered = True
-        set_detail(row, f"{len(phones)} numbers ready")
-
-        def fetch_code(phone: str) -> str:
+        price_index = 0
+        while True:
             ensure_active(row)
-            with state_lock:
-                row["phone"] = phone
-                row["detail"] = f"Waiting for SMS on {phone}"
-                save_store()
-            console(row, f"Waiting for SMS on {phone}")
-            payload = call_service(row, PROVIDERS[provider]["base"], "/get_code", {"phone": phone}, 360)
-            return str(payload.get("code") or "") if payload.get("ok") else ""
+            started = call_service(
+                row,
+                PROVIDERS[provider]["base"],
+                "/get_started",
+                {"email": email_key, "type": kind, "count": 3, "price_index": price_index},
+                240,
+            )
+            phones = phone_values(started)[:3]
+            if not started.get("ok") or not phones:
+                error = str(started.get("error") or "The number service did not return a phone")
+                if price_index and "no cheaper price" in error.lower():
+                    raise RuntimeError("No cheaper phone price is left")
+                raise RuntimeError(error)
+            ordered = True
+            set_detail(row, f"{len(phones)} numbers ready")
 
-        def log(message: str) -> None:
-            ensure_active(row)
-            set_detail(row, message)
+            def fetch_code(phone: str) -> str:
+                ensure_active(row)
+                with state_lock:
+                    row["phone"] = phone
+                    row["detail"] = f"Waiting for SMS on {phone}"
+                    save_store()
+                console(row, f"Waiting for SMS on {phone}")
+                payload = call_service(row, PROVIDERS[provider]["base"], "/get_code", {"phone": phone}, 180)
+                return str(payload.get("code") or "") if payload.get("ok") else ""
 
-        def stop() -> None:
-            ensure_active(row)
+            def log(message: str) -> None:
+                ensure_active(row)
+                set_detail(row, message)
 
-        url = WEBDE_URL if kind == "webde" else GMX_URL
-        profile = re.sub(r"[^A-Za-z0-9._-]+", "-", f"{row['first']}-{row['last']}").strip("-") or row["id"]
-        mailbox, used = generate_mailbox(
-            profile,
-            row["first"],
-            row["last"],
-            row["day"],
-            row["month"],
-            row["year"],
-            row["plz"],
-            row["city"],
-            row["street"],
-            row.get("country") or "DE",
-            row["password"],
-            url,
-            phones,
-            fetch_code,
-            log=log,
-            stop=stop,
-        )
+            def stop() -> None:
+                ensure_active(row)
+
+            url = WEBDE_URL if kind == "webde" else GMX_URL
+            profile = re.sub(r"[^A-Za-z0-9._-]+", "-", f"{row['first']}-{row['last']}").strip("-") or row["id"]
+            try:
+                mailbox, used = generate_mailbox(
+                    profile,
+                    row["first"],
+                    row["last"],
+                    row["day"],
+                    row["month"],
+                    row["year"],
+                    row["plz"],
+                    row["city"],
+                    row["street"],
+                    row.get("country") or "DE",
+                    row["password"],
+                    url,
+                    phones,
+                    fetch_code,
+                    log=log,
+                    stop=stop,
+                )
+            except SignupRestart:
+                console(row, "Three numbers failed. Restarting with the next cheaper price.")
+                if ordered:
+                    try:
+                        finish_numbers(provider, email_key, row)
+                    except RowCancelled:
+                        raise
+                    ordered = False
+                price_index += 1
+                if price_index >= 6:
+                    raise RuntimeError("Three phone numbers failed at every cheaper price")
+                continue
+            break
         created = now_stamp()
         with state_lock:
             row["status"] = "done"

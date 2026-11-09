@@ -51,7 +51,6 @@ PROFILE_DIR = ROOT / "anosim_browser"
 OTP_WAIT_SECONDS = 120
 ORDER_WAIT_SECONDS = 45
 CLOSE_WAIT_SECONDS = 180
-DASHBOARD_REFRESH_SECONDS = 8
 ACTION_PAUSE = 0.8
 
 
@@ -149,6 +148,18 @@ def order_count(override: int | None = None) -> int:
     if override < 1 or override > 10:
         raise ValueError("count must be from 1 to 10")
     return override
+
+
+def price_index(value) -> int:
+    if value is None or str(value).strip() == "":
+        return 0
+    raw = str(value).strip()
+    if not raw.isdigit():
+        raise ValueError("price_index must be a number from 0 to 20")
+    index = int(raw)
+    if index > 20:
+        raise ValueError("price_index must be a number from 0 to 20")
+    return index
 
 
 class SmsError(Exception):
@@ -1342,12 +1353,15 @@ class NumberService:
     def open(self) -> None:
         self._submit("sign in", self.browser.ensure_session)
 
-    def get_started(self, email: str, kind: str, count: int | None = None) -> dict:
+    def get_started(self, email: str, kind: str, count: int | None = None, tier: int = 0) -> dict:
         email = email.strip()
         if "@" not in email or len(email) > 200:
             raise ValueError("email is invalid")
         provider = normalize_type(kind)
         wanted = order_count(count)
+        chosen = price_index(tier)
+        if chosen:
+            return {"ok": False, "error": "no cheaper price", "email": email, "type": provider, "phones": [], "orders": []}
         return self._submit(
             f"get_started {email} ({provider})",
             lambda email=email, provider=provider, wanted=wanted: self._get_started(email, provider, wanted),
@@ -1447,17 +1461,14 @@ class NumberService:
 
     def _get_code(self, page: Dashboard, number: str) -> dict:
         deadline = time.monotonic() + OTP_WAIT_SECONDS
-        refresh = False
         found_row = False
         while time.monotonic() < deadline:
             try:
-                rows = page.show_dashboard(refresh=refresh)
+                rows = page.show_dashboard(refresh=False)
             except (SmsError, RuntimeError, TimeoutError, OSError) as exc:
-                log(f"Could not refresh the dashboard: {exc}")
-                refresh = True
+                log(f"Could not read the dashboard: {exc}")
                 time.sleep(2)
                 continue
-            refresh = True
             row = next((item for item in rows if same_phone(item["phone"], number)), None)
             if row and not found_row:
                 found_row = True
@@ -1467,9 +1478,7 @@ class NumberService:
                 self.store.mark(number, "coded")
                 log(f"OTP for {number} is {code}")
                 return {"ok": True, "phone": plus_phone(number), "code": code}
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(DASHBOARD_REFRESH_SECONDS)
+            time.sleep(2)
         log(f"No OTP for {number} within 2 minutes")
         return {"ok": False, "error": "failed", "phone": plus_phone(number)}
 
@@ -1578,7 +1587,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/get_started":
                 count = body.get("count")
                 parsed = int(count) if count is not None and str(count).strip() != "" else None
-                payload = self.service.get_started(str(body.get("email") or ""), str(body.get("type") or ""), parsed)
+                payload = self.service.get_started(
+                    str(body.get("email") or ""),
+                    str(body.get("type") or ""),
+                    parsed,
+                    price_index(body.get("price_index")),
+                )
                 self._send(payload, 200)
                 return
             if path == "/get_code":

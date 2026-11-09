@@ -6,7 +6,8 @@ Keeps one browser signed in to the number dashboard and serves three calls:
     POST /get_code      {"phone": "4915907997950"}
     POST /code_passed   {"email": "name@gmx.net"}
 
-`type` is `gmx` or `webde`. Each get_started types SMS_CODE_ORDER_COUNT into
+`type` is `gmx` or `webde`. price_index 0 orders the cheapest Germany tile, and a
+higher index orders the next cheaper tile. Each get_started types SMS_CODE_ORDER_COUNT into
 the quantity field, clicks Create Order once, waits 5 seconds, and saves the
 top new numbers under that email in sms_orders.json. Each get_code opens its own
 page immediately, waits up to 2 minutes for an OTP, and closes that page when
@@ -150,6 +151,18 @@ def order_count(override: int | None = None) -> int:
     if override < 1 or override > 100:
         raise ValueError("count must be from 1 to 100")
     return override
+
+
+def price_index(value) -> int:
+    if value is None or str(value).strip() == "":
+        return 0
+    raw = str(value).strip()
+    if not raw.isdigit():
+        raise ValueError("price_index must be a number from 0 to 20")
+    index = int(raw)
+    if index > 20:
+        raise ValueError("price_index must be a number from 0 to 20")
+    return index
 
 
 class SmsError(Exception):
@@ -1094,45 +1107,50 @@ class SmsService:
     def open(self) -> None:
         self._submit("sign in", self.browser.ensure_session)
 
-    def get_started(self, email: str, kind: str, count: int | None = None) -> dict:
+    def get_started(self, email: str, kind: str, count: int | None = None, tier: int = 0) -> dict:
         email = email.strip()
         if "@" not in email or len(email) > 200:
             raise ValueError("email is invalid")
         provider = normalize_type(kind)
         wanted = order_count(count)
+        chosen = price_index(tier)
         return self._submit(
-            f"get_started {email} ({provider})",
-            lambda email=email, provider=provider, wanted=wanted: self._get_started(email, provider, wanted),
+            f"get_started {email} ({provider}) price {chosen + 1}",
+            lambda email=email, provider=provider, wanted=wanted, chosen=chosen: self._get_started(email, provider, wanted, chosen),
         )
 
-    def _get_started(self, email: str, kind: str, count: int) -> dict:
+    def _get_started(self, email: str, kind: str, count: int, tier: int) -> dict:
         self.browser.ensure_session()
         self.browser.goto(self.browser.dashboard_url)
         self.browser.select_provider(kind)
         self.browser.wait_tiles()
-        exhausted: set[str] = set()
         phones: list[str] = []
         orders: list[dict] = []
         attempts = 0
-        while not orders and attempts < 6:
+        failure = "failed get number"
+        while not orders and attempts < 4:
             attempts += 1
-            tiles = [tile for tile in self.browser.list_tiles() if tile["id"] not in exhausted and tile["stock"] != 0]
+            tiles = [tile for tile in self.browser.list_tiles() if tile["stock"] != 0]
             if not tiles:
                 log("No Germany numbers with stock remain")
                 break
-            tile = tiles[0]
+            if tier >= len(tiles):
+                log("No cheaper price is left")
+                failure = "no cheaper price"
+                break
+            tile = tiles[tier]
             price_label = tile["price_text"] or (tile["price"] if tile["price"] is not None else "unknown price")
             stock_label = tile["stock"] if tile["stock"] is not None else "unknown"
-            log(f"Ordering cheapest Germany product {tile['id']} at {price_label} ({stock_label} avail)")
+            log(f"Ordering Germany product {tile['id']} at {price_label} ({stock_label} avail)")
             try:
                 result = self.browser.attempt_order(tile["id"], count)
             except (SmsError, RuntimeError, TimeoutError, OSError) as exc:
                 log(f"Order click failed: {exc}")
-                exhausted.add(tile["id"])
+                failure = str(exc)
                 continue
             if result["status"] != "ok":
                 log(result.get("text") or "Order was rejected")
-                exhausted.add(tile["id"])
+                failure = str(result.get("text") or "Order was rejected")
                 continue
             for card in result.get("cards") or []:
                 phone = str(card.get("phone") or "").strip()
@@ -1147,7 +1165,7 @@ class SmsService:
         payload = {"email": email, "type": kind, "phones": phones, "orders": orders}
         if not phones:
             payload["ok"] = False
-            payload["error"] = "failed get number"
+            payload["error"] = failure
             return payload
         payload["ok"] = True
         return payload
@@ -1171,15 +1189,11 @@ class SmsService:
 
     def _get_code(self, page: Dashboard, number: str, kind: str, order_id: str) -> dict:
         deadline = time.monotonic() + OTP_WAIT_SECONDS
-        next_reload = 0.0
+        try:
+            page.select_provider(kind)
+        except (SmsError, RuntimeError, TimeoutError, OSError) as exc:
+            log(f"Could not open the code page for {number}: {exc}")
         while time.monotonic() < deadline:
-            if time.monotonic() >= next_reload:
-                try:
-                    page.goto(page.dashboard_url)
-                    page.select_provider(kind)
-                except (SmsError, RuntimeError, TimeoutError, OSError) as exc:
-                    log(f"Could not refresh the code page for {number}: {exc}")
-                next_reload = time.monotonic() + 15
             code, found_id = self._read_code(page, number, order_id)
             if found_id:
                 order_id = found_id
@@ -1295,7 +1309,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/get_started":
                 count = body.get("count")
                 parsed = int(count) if count is not None and str(count).strip() != "" else None
-                payload = self.service.get_started(str(body.get("email") or ""), str(body.get("type") or ""), parsed)
+                payload = self.service.get_started(
+                    str(body.get("email") or ""),
+                    str(body.get("type") or ""),
+                    parsed,
+                    price_index(body.get("price_index")),
+                )
                 self._send(payload, 200)
                 return
             if path == "/get_code":

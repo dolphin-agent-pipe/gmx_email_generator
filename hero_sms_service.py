@@ -7,8 +7,9 @@ Keeps one browser signed in and serves three calls:
     POST /code_passed   {"email": "name@gmx.net"}
 
 `type` is `gmx` or `webde`. Each get_started searches that service, chooses
-Germany, and buys the cheapest price whose stock is above zero. It sets the
-order stepper to HERO_SMS_ORDER_COUNT (default 3, maximum 10) and clicks Buy
+Germany, and buys the cheapest in-stock price. price_index skips that many
+cheaper prices and buys the next one. It sets the order stepper to
+HERO_SMS_ORDER_COUNT (default 3, maximum 10) and clicks Buy
 once, so that one click orders every number. The new numbers are the top rows
 on the purchases page that were not listed before the click. They are saved
 under that email in kka_orders.json. get_code opens a new SERVICE_URL2/purchases/numbers
@@ -173,6 +174,18 @@ def order_count(override: int | None = None) -> int:
     if override < 1 or override > 10:
         raise ValueError("count must be from 1 to 10")
     return override
+
+
+def price_index(value) -> int:
+    if value is None or str(value).strip() == "":
+        return 0
+    raw = str(value).strip()
+    if not raw.isdigit():
+        raise ValueError("price_index must be a number from 0 to 20")
+    index = int(raw)
+    if index > 20:
+        raise ValueError("price_index must be a number from 0 to 20")
+    return index
 
 
 class SmsError(Exception):
@@ -1918,18 +1931,19 @@ class NumberService:
     def open(self) -> None:
         self._submit("sign in", self.browser.ensure_session)
 
-    def get_started(self, email: str, kind: str, count: int | None = None) -> dict:
+    def get_started(self, email: str, kind: str, count: int | None = None, tier: int = 0) -> dict:
         email = email.strip()
         if "@" not in email or len(email) > 200:
             raise ValueError("email is invalid")
         provider = normalize_type(kind)
         wanted = order_count(count)
+        chosen = price_index(tier)
         return self._submit(
-            f"get_started {email} ({provider})",
-            lambda email=email, provider=provider, wanted=wanted: self._get_started(email, provider, wanted),
+            f"get_started {email} ({provider}) price {chosen + 1}",
+            lambda email=email, provider=provider, wanted=wanted, chosen=chosen: self._get_started(email, provider, wanted, chosen),
         )
 
-    def _get_started(self, email: str, kind: str, count: int) -> dict:
+    def _get_started(self, email: str, kind: str, count: int, tier: int) -> dict:
         self.browser.ensure_session()
         phones: list[str] = []
         orders: list[dict] = []
@@ -1952,7 +1966,11 @@ class NumberService:
                     log("No price with stock above zero")
                     failure = "failed get number"
                     break
-                offer = offers[0]
+                if tier >= len(offers):
+                    log("No cheaper price is left")
+                    failure = "no cheaper price"
+                    break
+                offer = offers[tier]
                 stock_label = offer["stock_text"] or f"{offer['stock']} pcs"
                 log(f"Buying {count} at {offer['price_text']} ({stock_label})")
                 try:
@@ -2000,7 +2018,6 @@ class NumberService:
         try:
             target = self.browser.open_code_page()
             deadline = time.monotonic() + OTP_WAIT_SECONDS
-            next_reload = time.monotonic() + PURCHASES_REFRESH_SECONDS
             found_row = False
             while time.monotonic() < deadline:
                 try:
@@ -2019,16 +2036,7 @@ class NumberService:
                     self.store.mark(number, "coded")
                     log(f"OTP for {number} is {code}")
                     return {"ok": True, "phone": plus_phone(number), "code": code}
-                if time.monotonic() >= next_reload:
-                    try:
-                        self.browser.reload()
-                        if "purchases/numbers" not in self.browser.href():
-                            self.browser.goto(PURCHASES_URL)
-                    except (SmsError, RuntimeError, TimeoutError, OSError) as exc:
-                        log(f"Could not refresh the purchases page: {exc}")
-                    next_reload = time.monotonic() + PURCHASES_REFRESH_SECONDS
-                else:
-                    time.sleep(1)
+                time.sleep(1)
             log(f"No OTP for {number} within 2 minutes")
             return {"ok": False, "error": "failed", "phone": plus_phone(number)}
         finally:
@@ -2135,7 +2143,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/get_started":
                 count = body.get("count")
                 parsed = int(count) if count is not None and str(count).strip() != "" else None
-                payload = self.service.get_started(str(body.get("email") or ""), str(body.get("type") or ""), parsed)
+                payload = self.service.get_started(
+                    str(body.get("email") or ""),
+                    str(body.get("type") or ""),
+                    parsed,
+                    price_index(body.get("price_index")),
+                )
                 self._send(payload, 200)
                 return
             if path == "/get_code":

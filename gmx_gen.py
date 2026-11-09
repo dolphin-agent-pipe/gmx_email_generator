@@ -717,6 +717,17 @@ def type_into(cdp: Cdp, selector: str, text: str) -> None:
         raise SystemExit(f"{selector} stayed {typed!r} after typing {text!r}")
 
 
+def press_enter(cdp: Cdp) -> None:
+    cdp.call(
+        "Input.dispatchKeyEvent",
+        {"type": "keyDown", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13},
+    )
+    cdp.call(
+        "Input.dispatchKeyEvent",
+        {"type": "keyUp", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13},
+    )
+
+
 def captcha_frame_session(cdp: Cdp) -> str | None:
     payload = cdp.call("Target.getTargets")
     for info in payload.get("targetInfos") or []:
@@ -1362,6 +1373,14 @@ class NoPhonesLeft(Exception):
     pass
 
 
+class SignupRestart(Exception):
+    pass
+
+
+PHONE_EDIT_BUTTON = "button.mobile-phone-step__edit-inline"
+MAX_SUPPLIED_PHONES = 3
+
+
 def pick_free_number(cdp: Cdp, skip: set[str] | None = None) -> dict:
     usage, banned = load_store()
     banned_numbers = set(banned)
@@ -1573,6 +1592,64 @@ def return_to_phone_form(cdp: Cdp) -> None:
     raise SystemExit("Phone form did not return after the rejected number")
 
 
+def prepare_phone_entry(cdp: Cdp, replace: bool, stop=None) -> None:
+    if replace:
+        deadline = time.time() + 12
+        clicked = False
+        while time.time() < deadline:
+            if stop:
+                stop()
+            if click_selector(cdp, PHONE_EDIT_BUTTON):
+                print("Clicked the phone edit button")
+                clicked = True
+                break
+            try:
+                if element_box(cdp, "#mobilePhone"):
+                    break
+            except (RuntimeError, TimeoutError):
+                pass
+            time.sleep(0.4)
+        if not clicked:
+            try:
+                ready = bool(element_box(cdp, "#mobilePhone"))
+            except (RuntimeError, TimeoutError):
+                ready = False
+            if not ready:
+                raise SystemExit("Could not find the phone edit button")
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if stop:
+            stop()
+        try:
+            if element_box(cdp, "#mobilePhone"):
+                return
+        except (RuntimeError, TimeoutError):
+            pass
+        time.sleep(0.4)
+    raise SystemExit("Phone form did not appear")
+
+
+def phone_submission_state(cdp: Cdp, timeout: float = 8) -> str:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if registration_failed(page_url(cdp)):
+            return "rejected"
+        try:
+            if element_box(cdp, "[name='confirmationCode.0.digit']"):
+                return "code"
+        except (RuntimeError, TimeoutError):
+            pass
+        time.sleep(0.4)
+    if registration_failed(page_url(cdp)):
+        return "rejected"
+    try:
+        if element_box(cdp, "[name='confirmationCode.0.digit']"):
+            return "code"
+    except (RuntimeError, TimeoutError):
+        pass
+    return "rejected"
+
+
 def phone_number_rejected(cdp: Cdp, timeout: float = 8) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -1625,6 +1702,7 @@ def verify_phone(gmx: Cdp, port: int) -> None:
         login_anosim(anosim)
         test_mode = anosim_test_mode()
         skipped: set[str] = set()
+        replace_phone = False
         while True:
             chosen = pick_free_number(anosim, skipped)
             source = str(chosen["number"])
@@ -1633,23 +1711,24 @@ def verify_phone(gmx: Cdp, port: int) -> None:
             if test_mode:
                 print(f"Test mode: GMX gets {submit}; SMS is read from {source}")
             prefix, national = split_phone(submit)
-            deadline = time.time() + 25
-            while time.time() < deadline and not element_box(gmx, "#mobilePhone"):
-                time.sleep(0.4)
-            if not element_box(gmx, "#mobilePhone"):
-                raise SystemExit("Phone form did not appear")
+            try:
+                prepare_phone_entry(gmx, replace_phone)
+            except SystemExit:
+                if not replace_phone:
+                    raise
+                return_to_phone_form(gmx)
+                prepare_phone_entry(gmx, False)
             selected = select_option(gmx, "#mobilePhonePrefix", prefix)
             if selected != prefix:
                 raise SystemExit(f"Could not select country code {prefix}")
             type_into(gmx, "#mobilePhone", national)
             print(f"Filled {prefix} {national}")
-            if not click_selector(gmx, "button[aria-label='Weiter'][data-testid='next-button']"):
-                raise SystemExit("Could not find the phone Weiter button")
-            print("Clicked Weiter")
+            press_enter(gmx)
+            print("Pressed Enter")
+            replace_phone = True
             if phone_number_rejected(gmx):
                 print(f"{source} opened https://hilfe.gmx.net/kundenservice/flexreg.html")
                 ban_number(source)
-                return_to_phone_form(gmx)
                 continue
             if test_mode:
                 print(f"Test mode leaves {source} unused")
@@ -1671,7 +1750,6 @@ def verify_phone(gmx: Cdp, port: int) -> None:
                 if result == "banned":
                     print(f"{source} opened https://hilfe.gmx.net/kundenservice/flexreg.html")
                     ban_number(source)
-                    return_to_phone_form(gmx)
                     switch_number = True
                     break
                 if result == "accepted":
@@ -1683,7 +1761,6 @@ def verify_phone(gmx: Cdp, port: int) -> None:
             else:
                 print(f"No working GMX SMS for {source} after 3 tries")
                 skipped.add(source)
-                return_to_phone_form(gmx)
                 continue
             if switch_number:
                 continue
@@ -1725,11 +1802,10 @@ def fill_signup(
     time.sleep(pause)
 
     click_human_check(cdp)
-    until = time.time() + 20
+    pause = random.uniform(4, 6)
+    print(f"Waiting {pause:.1f}s before Get started")
+    time.sleep(pause)
     status = captcha_status(cdp)
-    while time.time() < until and status.get("checked") != "true" and not status.get("token"):
-        time.sleep(1)
-        status = captcha_status(cdp)
     if status.get("checked") == "true" or status.get("token"):
         print("I am human check completed")
     else:
@@ -1752,41 +1828,34 @@ def fill_signup(
 
 
 def verify_supplied_phones(gmx: Cdp, phones: list[str], fetch_code, log=print, stop=None) -> str:
-    pending = [str(phone).strip() for phone in phones if str(phone).strip()]
+    pending = [str(phone).strip() for phone in phones if str(phone).strip()][:MAX_SUPPLIED_PHONES]
     if not pending:
         raise NoPhonesLeft("No phone numbers were returned")
-    for source in pending:
-        number = source if source.startswith("+") else f"+{re.sub(r'[^0-9]', '', source)}"
-        log(f"Trying {number}")
-        prefix, national = split_phone(number)
-        deadline = time.time() + 25
-        while time.time() < deadline and not element_box(gmx, "#mobilePhone"):
-            if stop:
-                stop()
-            time.sleep(0.4)
+    for index, source in enumerate(pending):
         if stop:
             stop()
-        if not element_box(gmx, "#mobilePhone"):
-            raise SystemExit("Phone form did not appear")
+        number = source if source.startswith("+") else f"+{re.sub(r'[^0-9]', '', source)}"
+        log(f"Trying {number} ({index + 1} of {len(pending)})")
+        prefix, national = split_phone(number)
+        prepare_phone_entry(gmx, index > 0, stop)
+        if stop:
+            stop()
         selected = select_option(gmx, "#mobilePhonePrefix", prefix)
         if selected != prefix:
             raise SystemExit(f"Could not select country code {prefix}")
         type_into(gmx, "#mobilePhone", national)
         print(f"Filled {prefix} {national}")
-        if not click_selector(gmx, "button[aria-label='Weiter'][data-testid='next-button']"):
-            raise SystemExit("Could not find the phone Weiter button")
-        print("Clicked Weiter")
-        if phone_number_rejected(gmx):
+        press_enter(gmx)
+        print("Pressed Enter")
+        if phone_submission_state(gmx) != "code":
             print(f"{number} was rejected")
             log(f"{number} was rejected")
-            return_to_phone_form(gmx)
             continue
         log(f"Waiting for SMS on {number}")
         code = str(fetch_code(number) or "").strip()
         if not code:
             print(f"No SMS code for {number}")
             log(f"No SMS code for {number}")
-            return_to_phone_form(gmx)
             continue
         result = submit_confirmation_code(gmx, code)
         if result == "accepted":
@@ -1797,8 +1866,7 @@ def verify_supplied_phones(gmx: Cdp, phones: list[str], fetch_code, log=print, s
             return number
         print(f"Confirmation failed for {number}: {result}")
         log(f"{number} did not verify")
-        return_to_phone_form(gmx)
-    raise NoPhonesLeft("None of the returned phone numbers could finish verification")
+    raise SignupRestart("Three phone numbers failed to verify")
 
 
 def generate_mailbox(
