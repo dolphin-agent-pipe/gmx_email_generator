@@ -616,24 +616,29 @@ def evaluate(cdp: Cdp, expression: str, session_id: str | None = None, timeout: 
 
 
 def navigate(cdp: Cdp, url: str) -> str:
-    cdp.call("Page.enable")
-    cdp.call("Page.navigate", {"url": url}, timeout=45)
-    deadline = time.time() + 45
     last = ""
-    while time.time() < deadline:
-        value = str(evaluate(cdp, "document.readyState + '\\n' + location.href + '\\n' + document.title") or "")
-        state, _, rest = value.partition("\n")
-        href, _, title = rest.partition("\n")
-        last = href or last
-        if state == "complete" and href and not href.startswith("about:") and not href.startswith("chrome"):
-            print(f"Opened {href}")
-            if title:
-                print(f"Title: {title}")
-            return href
-        time.sleep(1)
+    for attempt in range(2):
+        cdp.call("Page.enable")
+        cdp.call("Page.navigate", {"url": url}, timeout=45)
+        deadline = time.time() + 45
+        last = ""
+        while time.time() < deadline:
+            value = str(evaluate(cdp, "document.readyState + '\\n' + location.href + '\\n' + document.title") or "")
+            state, _, rest = value.partition("\n")
+            href, _, title = rest.partition("\n")
+            last = href or last
+            if state == "complete" and href and not href.startswith("about:") and not href.startswith("chrome"):
+                print(f"Opened {href}")
+                if title:
+                    print(f"Title: {title}")
+                return href
+            time.sleep(1)
+        if attempt == 0:
+            print("Page failed to load. Opening it again.")
+            continue
+        break
     if last:
         print(f"Opened {last}")
-        return last
     raise SystemExit(f"Browser started, but {url} did not finish loading")
 
 
@@ -720,12 +725,55 @@ def type_into(cdp: Cdp, selector: str, text: str) -> None:
 def press_enter(cdp: Cdp) -> None:
     cdp.call(
         "Input.dispatchKeyEvent",
-        {"type": "keyDown", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13},
+        {
+            "type": "rawKeyDown",
+            "key": "Enter",
+            "code": "Enter",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 13,
+        },
+    )
+    cdp.call(
+        "Input.dispatchKeyEvent",
+        {
+            "type": "char",
+            "key": "Enter",
+            "code": "Enter",
+            "text": "\r",
+            "unmodifiedText": "\r",
+            "windowsVirtualKeyCode": 13,
+            "nativeVirtualKeyCode": 13,
+        },
     )
     cdp.call(
         "Input.dispatchKeyEvent",
         {"type": "keyUp", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13},
     )
+
+
+def submit_phone_form(cdp: Cdp) -> None:
+    press_enter(cdp)
+    print("Pressed Enter")
+    time.sleep(1.2)
+    try:
+        advanced = bool(element_box(cdp, "[name='confirmationCode.0.digit']"))
+        still_there = bool(element_box(cdp, "#mobilePhone"))
+    except (RuntimeError, TimeoutError):
+        return
+    if advanced or not still_there:
+        return
+    evaluate(
+        cdp,
+        "(() => {"
+        " const el = document.querySelector('#mobilePhone');"
+        " const form = el && el.form;"
+        " if (!form) return false;"
+        " if (form.requestSubmit) form.requestSubmit();"
+        " else form.submit();"
+        " return true;"
+        "})()",
+    )
+    print("Submitted the phone form")
 
 
 def captcha_frame_session(cdp: Cdp) -> str | None:
@@ -764,6 +812,21 @@ def click_human_check(cdp: Cdp) -> None:
         print("Clicked I am human")
         return
     raise SystemExit("Could not find the I am human checkbox")
+
+
+def signup_buttons(cdp: Cdp) -> str:
+    raw = evaluate(
+        cdp,
+        "(() => {"
+        " const nodes = [...document.querySelectorAll('button, [data-testid]')].slice(0, 25);"
+        " return nodes.map((el) => {"
+        " const r = el.getBoundingClientRect();"
+        " const text = (el.innerText || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim().slice(0, 60);"
+        " return [el.tagName, el.getAttribute('data-testid') || '', text, Math.round(r.width), Math.round(r.height), el.disabled ? 'disabled' : ''].filter(Boolean).join(' ');"
+        " }).join(' | ');"
+        "})()",
+    )
+    return str(raw or "")
 
 
 def captcha_status(cdp: Cdp) -> dict:
@@ -1061,7 +1124,7 @@ def visible_mailbox(cdp: Cdp, fallback: str) -> str:
             cdp,
             "(() => {"
             " const text = document.body ? document.body.innerText : '';"
-            " const match = text.match(/[A-Za-z0-9._%+-]+@(?:gmx|web)\\.[A-Za-z.]+/);"
+            " const match = text.match(/[A-Za-z0-9._%+-]+@(?:web\\.de|gmx\\.net|gmx\\.de|gmx\\.com|gmx\\.at|gmx\\.ch)/i);"
             " return match ? match[0] : '';"
             "})()",
         )
@@ -1539,6 +1602,47 @@ def fetch_sms_code(
     return None
 
 
+def phone_entry_details(cdp: Cdp) -> str:
+    try:
+        raw = evaluate(
+            cdp,
+            "(() => {"
+            " const input = document.querySelector('#mobilePhone');"
+            " const prefix = document.querySelector('#mobilePhonePrefix');"
+            " const options = prefix ? [...prefix.options].slice(0, 6).map((option) => option.value + '=' + option.text.trim()) : [];"
+            " return {placeholder: input ? input.placeholder : '', value: input ? input.value : '', prefix: prefix ? prefix.value : '', options};"
+            "})()",
+        )
+    except (RuntimeError, TimeoutError):
+        return ""
+    return str(raw or "").encode("ascii", errors="replace").decode("ascii")
+
+
+def phone_variants(national: str) -> list[str]:
+    variants = [national]
+    if national.startswith("0"):
+        trimmed = national[1:]
+        if trimmed:
+            variants.append(trimmed)
+    else:
+        variants.append("0" + national)
+    return variants
+
+
+def form_message(cdp: Cdp) -> str:
+    try:
+        raw = evaluate(
+            cdp,
+            "(() => {"
+            " const nodes = [...document.querySelectorAll('[role=\"alert\"], [class*=\"error\"], [class*=\"Error\"]')];"
+            " return nodes.map((node) => (node.innerText || '').replace(/\\s+/g, ' ').trim()).filter(Boolean).slice(0, 3).join(' / ');"
+            "})()",
+        )
+    except (RuntimeError, TimeoutError):
+        return ""
+    return str(raw or "")[:240]
+
+
 def page_url(cdp: Cdp) -> str:
     try:
         return str(evaluate(cdp, "location.href") or "")
@@ -1548,7 +1652,9 @@ def page_url(cdp: Cdp) -> str:
 
 def registration_failed(url: str) -> bool:
     parsed = urllib.parse.urlparse(url)
-    return parsed.netloc == "hilfe.gmx.net" and parsed.path.rstrip("/").endswith("flexreg.html")
+    if parsed.netloc.lower() not in {"hilfe.gmx.net", "hilfe.web.de"}:
+        return False
+    return parsed.path.rstrip("/").endswith("flexreg.html")
 
 
 def go_back(cdp: Cdp) -> None:
@@ -1723,8 +1829,7 @@ def verify_phone(gmx: Cdp, port: int) -> None:
                 raise SystemExit(f"Could not select country code {prefix}")
             type_into(gmx, "#mobilePhone", national)
             print(f"Filled {prefix} {national}")
-            press_enter(gmx)
-            print("Pressed Enter")
+            submit_phone_form(gmx)
             replace_phone = True
             if phone_number_rejected(gmx):
                 print(f"{source} opened https://hilfe.gmx.net/kundenservice/flexreg.html")
@@ -1805,13 +1910,38 @@ def fill_signup(
     pause = random.uniform(4, 6)
     print(f"Waiting {pause:.1f}s before Get started")
     time.sleep(pause)
-    status = captcha_status(cdp)
-    if status.get("checked") == "true" or status.get("token"):
-        print("I am human check completed")
-    else:
-        print("I am human was clicked. CaptchaFox has not confirmed it yet.")
-
-    if not click_selector(cdp, "button[data-testid='next-button']"):
+    deadline = time.time() + 25
+    clicked = False
+    retried_human = False
+    reported_captcha = False
+    while time.time() < deadline:
+        status = captcha_status(cdp)
+        confirmed = status.get("checked") == "true" or bool(status.get("token"))
+        if confirmed and not reported_captcha:
+            print("I am human check completed")
+            reported_captcha = True
+        if registration_failed(page_url(cdp)):
+            print(f"Registration was sent to {page_url(cdp)}")
+            raise SystemExit("Registration was sent to the help page")
+        if click_selector(cdp, "button[data-testid='next-button'], [data-testid='next-button']"):
+            clicked = True
+            break
+        checkbox = "#captchafox .cf-checkbox, #captchafox [role='checkbox'], #captchafox iframe, iframe[src*='captchafox']"
+        if not confirmed and not retried_human and element_box(cdp, checkbox):
+            print("I am human was clicked. CaptchaFox has not confirmed it yet.")
+            retried_human = True
+            try:
+                click_human_check(cdp)
+            except SystemExit:
+                print("I am human checkbox was gone")
+            extra = random.uniform(4, 6)
+            print(f"Waiting {extra:.1f}s before Get started")
+            time.sleep(extra)
+            continue
+        time.sleep(0.5)
+    if not clicked:
+        print(f"Get started button missing at {page_url(cdp)}")
+        print(signup_buttons(cdp).encode("ascii", errors="replace").decode("ascii"))
         raise SystemExit("Could not find the Get started button")
     print("Clicked Get started")
     mailbox = choose_email(cdp, email)
@@ -1837,18 +1967,38 @@ def verify_supplied_phones(gmx: Cdp, phones: list[str], fetch_code, log=print, s
         number = source if source.startswith("+") else f"+{re.sub(r'[^0-9]', '', source)}"
         log(f"Trying {number} ({index + 1} of {len(pending)})")
         prefix, national = split_phone(number)
-        prepare_phone_entry(gmx, index > 0, stop)
-        if stop:
-            stop()
-        selected = select_option(gmx, "#mobilePhonePrefix", prefix)
-        if selected != prefix:
-            raise SystemExit(f"Could not select country code {prefix}")
-        type_into(gmx, "#mobilePhone", national)
-        print(f"Filled {prefix} {national}")
-        press_enter(gmx)
-        print("Pressed Enter")
-        if phone_submission_state(gmx) != "code":
-            print(f"{number} was rejected")
+        reached_code = False
+        for variant_index, variant in enumerate(phone_variants(national)):
+            if stop:
+                stop()
+            try:
+                prepare_phone_entry(gmx, index > 0 or variant_index > 0, stop)
+            except SystemExit as exc:
+                if index == 0 and variant_index == 0:
+                    raise
+                print(str(exc))
+                raise SignupRestart("The phone form closed before the numbers finished") from exc
+            if stop:
+                stop()
+            selected = select_option(gmx, "#mobilePhonePrefix", prefix)
+            if selected != prefix:
+                raise SystemExit(f"Could not select country code {prefix}")
+            type_into(gmx, "#mobilePhone", variant)
+            print(f"Filled {prefix} {variant}")
+            print(phone_entry_details(gmx))
+            submit_phone_form(gmx)
+            if phone_submission_state(gmx) == "code":
+                reached_code = True
+                break
+            note = page_url(gmx)
+            detail = form_message(gmx)
+            print(f"{number} was rejected as {variant} ({note}) {detail}".rstrip())
+            if registration_failed(note):
+                break
+            lowered = detail.lower()
+            if lowered and not any(word in lowered for word in ("ung", "invalid", "telefonnummer")):
+                break
+        if not reached_code:
             log(f"{number} was rejected")
             continue
         log(f"Waiting for SMS on {number}")

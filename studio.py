@@ -21,6 +21,7 @@ import json
 import os
 import re
 import threading
+import time
 import traceback
 import urllib.error
 import urllib.request
@@ -70,8 +71,10 @@ PROVIDERS = {
 COLUMNS = ("first", "last", "day", "month", "year", "plz", "city", "street", "password")
 
 state_lock = threading.Lock()
+order_lock = threading.Lock()
 state: dict = {"rows": [], "history": [], "running": False, "provider": "smscode", "kind": "gmx"}
 worker: threading.Thread | None = None
+inflight = 0
 
 
 def now_stamp() -> str:
@@ -277,21 +280,30 @@ def run_row(row: dict, provider: str, kind: str) -> None:
     ordered = False
     try:
         price_index = 0
+        failed_batches = 0
         while True:
             ensure_active(row)
-            started = call_service(
-                row,
-                PROVIDERS[provider]["base"],
-                "/get_started",
-                {"email": email_key, "type": kind, "count": 3, "price_index": price_index},
-                240,
-            )
+            with order_lock:
+                ensure_active(row)
+                started = call_service(
+                    row,
+                    PROVIDERS[provider]["base"],
+                    "/get_started",
+                    {"email": email_key, "type": kind, "count": 3, "price_index": price_index},
+                    240,
+                )
             phones = phone_values(started)[:3]
             if not started.get("ok") or not phones:
                 error = str(started.get("error") or "The number service did not return a phone")
-                if price_index and "no cheaper price" in error.lower():
+                lowered = error.lower()
+                if price_index >= 20 or any(
+                    phrase in lowered
+                    for phrase in ("no cheaper price", "no germany numbers", "no price with stock", "numbers with stock remain")
+                ):
                     raise RuntimeError("No cheaper phone price is left")
-                raise RuntimeError(error)
+                price_index += 1
+                console(row, f"{error} Trying the next price.")
+                continue
             ordered = True
             set_detail(row, f"{len(phones)} numbers ready")
 
@@ -314,37 +326,56 @@ def run_row(row: dict, provider: str, kind: str) -> None:
 
             url = WEBDE_URL if kind == "webde" else GMX_URL
             profile = re.sub(r"[^A-Za-z0-9._-]+", "-", f"{row['first']}-{row['last']}").strip("-") or row["id"]
-            try:
-                mailbox, used = generate_mailbox(
-                    profile,
-                    row["first"],
-                    row["last"],
-                    row["day"],
-                    row["month"],
-                    row["year"],
-                    row["plz"],
-                    row["city"],
-                    row["street"],
-                    row.get("country") or "DE",
-                    row["password"],
-                    url,
-                    phones,
-                    fetch_code,
-                    log=log,
-                    stop=stop,
-                )
-            except SignupRestart:
-                console(row, "Three numbers failed. Restarting with the next cheaper price.")
+            mailbox = ""
+            used = ""
+            restarted = False
+            for browser_try in range(3):
+                ensure_active(row)
+                try:
+                    mailbox, used = generate_mailbox(
+                        profile,
+                        row["first"],
+                        row["last"],
+                        row["day"],
+                        row["month"],
+                        row["year"],
+                        row["plz"],
+                        row["city"],
+                        row["street"],
+                        row.get("country") or "DE",
+                        row["password"],
+                        url,
+                        phones,
+                        fetch_code,
+                        log=log,
+                        stop=stop,
+                    )
+                    break
+                except SignupRestart:
+                    restarted = True
+                    break
+                except SystemExit as exc:
+                    message = str(getattr(exc, "code", "") or exc).strip() or "Generation failed"
+                    if browser_try == 2 or "phone" in message.lower():
+                        raise
+                    console(row, f"{message}. Opening the signup again.")
+            if restarted:
                 if ordered:
                     try:
                         finish_numbers(provider, email_key, row)
                     except RowCancelled:
                         raise
                     ordered = False
+                failed_batches += 1
                 price_index += 1
-                if price_index >= 6:
-                    raise RuntimeError("Three phone numbers failed at every cheaper price")
+                if failed_batches >= 3:
+                    raise RuntimeError("Nine phone numbers failed to verify")
+                if price_index >= 21:
+                    raise RuntimeError("No cheaper phone price is left")
+                console(row, "Three numbers failed. Restarting with the next cheaper price.")
                 continue
+            if not mailbox:
+                raise RuntimeError("Generation failed")
             break
         created = now_stamp()
         with state_lock:
@@ -399,24 +430,47 @@ def run_row(row: dict, provider: str, kind: str) -> None:
                 pass
 
 
+def finish_row_thread() -> None:
+    global inflight
+    with state_lock:
+        inflight = max(0, inflight - 1)
+
+
+def run_row_thread(row: dict) -> None:
+    try:
+        run_row(row, str(row.get("provider") or ""), str(row.get("kind") or "gmx"))
+    except Exception:
+        traceback.print_exc()
+    finally:
+        finish_row_thread()
+
+
 def worker_loop() -> None:
+    global inflight
     try:
         while True:
             with state_lock:
                 row = next((item for item in state["rows"] if item.get("status") == "queued"), None)
                 if row is None:
-                    state["running"] = False
-                    save_store()
-                    return
-            if row_cancelled(row):
-                with state_lock:
+                    if inflight == 0:
+                        state["running"] = False
+                        save_store()
+                        return
+                elif row.get("cancel"):
                     row["status"] = "ready"
                     row["cancel"] = False
                     row["detail"] = "Cancelled"
                     save_store()
-                console(row, "Cancelled")
+                    console(row, "Cancelled")
+                    row = None
+                else:
+                    row["status"] = "running"
+                    inflight += 1
+                    save_store()
+            if row is None:
+                time.sleep(0.2)
                 continue
-            run_row(row, str(row.get("provider") or ""), str(row.get("kind") or "gmx"))
+            threading.Thread(target=run_row_thread, args=(row,), name=f"studio-row-{row.get('id')}", daemon=True).start()
     except Exception:
         traceback.print_exc()
         with state_lock:

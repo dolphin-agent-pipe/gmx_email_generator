@@ -1962,11 +1962,7 @@ class NumberService:
                     for offer in self.browser.list_offers()
                     if offer["stock"] is not None and offer["stock"] > 0
                 ]
-                if not offers:
-                    log("No price with stock above zero")
-                    failure = "failed get number"
-                    break
-                if tier >= len(offers):
+                if not offers or tier >= len(offers):
                     log("No cheaper price is left")
                     failure = "no cheaper price"
                     break
@@ -1981,6 +1977,9 @@ class NumberService:
                 clicked = bool(result.get("clicked"))
                 if not result.get("ok"):
                     log(str(result.get("error") or "Buy was rejected"))
+                    if tier + 1 >= len(offers):
+                        failure = "no cheaper price"
+                        break
                     continue
                 for item in result.get("phones") or []:
                     if not isinstance(item, dict):

@@ -1131,10 +1131,7 @@ class SmsService:
         while not orders and attempts < 4:
             attempts += 1
             tiles = [tile for tile in self.browser.list_tiles() if tile["stock"] != 0]
-            if not tiles:
-                log("No Germany numbers with stock remain")
-                break
-            if tier >= len(tiles):
+            if not tiles or tier >= len(tiles):
                 log("No cheaper price is left")
                 failure = "no cheaper price"
                 break
@@ -1151,6 +1148,11 @@ class SmsService:
             if result["status"] != "ok":
                 log(result.get("text") or "Order was rejected")
                 failure = str(result.get("text") or "Order was rejected")
+                if "no numbers" in failure.lower() or "another option" in failure.lower():
+                    if tier + 1 >= len(tiles):
+                        log("No cheaper price is left")
+                        failure = "no cheaper price"
+                    break
                 continue
             for card in result.get("cards") or []:
                 phone = str(card.get("phone") or "").strip()
