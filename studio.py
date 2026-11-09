@@ -33,6 +33,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
 STORE_FILE = ROOT / "studio_queue.json"
+ACCOUNTS_FILE = ROOT / "accounts.json"
 
 
 def load_env(path: Path) -> None:
@@ -106,6 +107,147 @@ def load_store() -> None:
 def save_store() -> None:
     payload = {"rows": state["rows"], "history": state["history"]}
     STORE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def read_store_file() -> tuple[list[dict], list[dict]]:
+    if not STORE_FILE.is_file():
+        return [], []
+    try:
+        loaded = json.loads(STORE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Could not read the queue file") from exc
+    if not isinstance(loaded, dict):
+        raise RuntimeError("Could not read the queue file")
+    rows = loaded.get("rows")
+    history = loaded.get("history")
+    disk_rows = [item for item in rows if isinstance(item, dict)] if isinstance(rows, list) else []
+    disk_history = [item for item in history if isinstance(item, dict)] if isinstance(history, list) else []
+    return disk_rows, disk_history
+
+
+def account_records() -> list[dict]:
+    if not ACCOUNTS_FILE.is_file():
+        return []
+    try:
+        raw = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict) and str(item.get("email") or "").strip()]
+
+
+PROFILE_FIELDS = ("first", "last", "day", "month", "year", "plz", "city", "street", "password", "country")
+
+
+def person_name(row: dict) -> str:
+    return f"{str(row.get('first') or '').strip()} {str(row.get('last') or '').strip()}".strip()
+
+
+def history_kind(row: dict) -> str:
+    kind = str(row.get("kind") or "")
+    if kind == "webde":
+        return "WEB.DE"
+    if kind == "gmx":
+        return "GMX"
+    return kind
+
+
+def history_provider(row: dict) -> str:
+    key = str(row.get("provider") or "")
+    provider = PROVIDERS.get(key)
+    return str(provider["label"]) if provider else key
+
+
+def apply_profile(item: dict, row: dict) -> None:
+    name = person_name(row)
+    if name:
+        item["name"] = name
+    phone = str(row.get("phone") or "").strip()
+    if phone:
+        item["phone"] = phone
+    password = str(row.get("password") or "")
+    if password and not str(item.get("password") or ""):
+        item["password"] = password
+    if not str(item.get("id") or "") and row.get("id"):
+        item["id"] = row["id"]
+    if not str(item.get("created_at") or "") and row.get("created_at"):
+        item["created_at"] = row["created_at"]
+    if not str(item.get("provider") or ""):
+        item["provider"] = history_provider(row)
+    if not str(item.get("kind") or ""):
+        item["kind"] = history_kind(row)
+
+
+def reload_store() -> None:
+    with state_lock:
+        disk_rows, disk_history = read_store_file()
+        accounts = account_records()
+        live = {
+            str(row.get("id")): row
+            for row in state["rows"]
+            if row.get("status") in {"running", "queued"} and row.get("id")
+        }
+        merged: list[dict] = []
+        seen: set[str] = set()
+        for row in disk_rows:
+            row_id = str(row.get("id") or "")
+            current = live.get(row_id)
+            if current is not None:
+                for key in PROFILE_FIELDS:
+                    if key in row:
+                        current[key] = row[key]
+                merged.append(current)
+            else:
+                merged.append(row)
+            if row_id:
+                seen.add(row_id)
+        for row_id, row in live.items():
+            if row_id not in seen:
+                merged.append(row)
+        by_id = {str(row.get("id") or ""): row for row in merged if row.get("id")}
+        by_email: dict[str, dict] = {}
+        for row in merged:
+            email = str(row.get("email") or "").strip().lower()
+            if "@" in email:
+                by_email.setdefault(email, row)
+        history: list[dict] = []
+        known: set[str] = set()
+        for item in disk_history:
+            row = by_id.get(str(item.get("id") or ""))
+            if row is None:
+                row = by_email.get(str(item.get("email") or "").strip().lower())
+            if row is not None:
+                apply_profile(item, row)
+            email = str(item.get("email") or "").strip().lower()
+            if email:
+                known.add(email)
+            history.append(item)
+        for account in accounts:
+            email = str(account.get("email") or "").strip()
+            key = email.lower()
+            if not key or key in known:
+                continue
+            row = by_email.get(key)
+            item = {
+                "id": "",
+                "created_at": "",
+                "email": email,
+                "password": str(account.get("password") or ""),
+                "provider": "",
+                "kind": "",
+                "name": "",
+                "phone": "",
+            }
+            if row is not None:
+                apply_profile(item, row)
+            history.append(item)
+            known.add(key)
+        state["rows"] = merged
+        state["history"] = history
+        save_store()
 
 
 def public_state() -> dict:
@@ -356,7 +498,17 @@ def run_row(row: dict, provider: str, kind: str) -> None:
                     break
                 except SystemExit as exc:
                     message = str(getattr(exc, "code", "") or exc).strip() or "Generation failed"
-                    if browser_try == 2 or "phone" in message.lower():
+                    lowered = message.lower()
+                    finished = any(
+                        phrase in lowered
+                        for phrase in (
+                            "created mailbox",
+                            "could not read the created mailbox",
+                            "could not save the mailbox",
+                            "zustimmen",
+                        )
+                    )
+                    if browser_try == 2 or "phone" in lowered or finished:
                         raise
                     console(row, f"{message}. Opening the signup again.")
             if restarted:
@@ -588,6 +740,7 @@ PAGE = r"""<!DOCTYPE html>
   .switch { display: inline-flex; padding: 2px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
   .switch button { border: 0; background: transparent; color: var(--muted); border-radius: 6px; padding: 5px 12px; font: inherit; cursor: pointer; }
   .switch button.active { background: var(--raised); color: var(--ink); }
+  .header-side { display: flex; align-items: center; gap: 12px; }
   main { flex: 1; min-height: 0; display: flex; padding: 16px 20px 20px; }
   .panel {
     flex: 1;
@@ -710,9 +863,12 @@ PAGE = r"""<!DOCTYPE html>
     <h1>Mailbox</h1>
     <span>GMX · WEB.DE</span>
   </div>
-  <div class="switch" role="tablist">
-    <button type="button" id="tab-generate" class="active">Generate</button>
-    <button type="button" id="tab-history">History</button>
+  <div class="header-side">
+    <button type="button" class="btn" id="reload">Reload</button>
+    <div class="switch" role="tablist">
+      <button type="button" id="tab-generate" class="active">Generate</button>
+      <button type="button" id="tab-history">History</button>
+    </div>
   </div>
 </header>
 <main>
@@ -782,6 +938,7 @@ const kind = document.querySelector("#kind");
 const queueBody = document.querySelector("#queue");
 const historyBody = document.querySelector("#history-body");
 let latest = {rows: [], history: [], running: false};
+let viewSeq = 0;
 const selected = new Set();
 
 function esc(value) {
@@ -875,9 +1032,8 @@ function renderHistory() {
   document.querySelector("#history-wrap").classList.toggle("hidden", rows.length === 0);
 }
 
-async function refresh() {
-  const response = await fetch("/api/state");
-  latest = await response.json();
+function applyState(payload) {
+  latest = payload;
   if (!provider.options.length) {
     provider.innerHTML = (latest.providers || []).map((item) => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join("");
     if (latest.provider) provider.value = latest.provider;
@@ -885,6 +1041,14 @@ async function refresh() {
   }
   renderQueue();
   renderHistory();
+}
+
+async function refresh() {
+  const seq = ++viewSeq;
+  const response = await fetch("/api/state");
+  const payload = await response.json();
+  if (seq !== viewSeq) return;
+  applyState(payload);
 }
 
 async function send(path, body) {
@@ -922,6 +1086,19 @@ document.querySelector("#file").onchange = async (event) => {
   await act("/api/import", {text: await file.text()});
 };
 document.querySelector("#clear").onclick = () => act("/api/clear", {});
+document.querySelector("#reload").onclick = async () => {
+  const button = document.querySelector("#reload");
+  button.disabled = true;
+  try {
+    const payload = await send("/api/reload", {});
+    viewSeq += 1;
+    applyState(payload);
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    button.disabled = false;
+  }
+};
 document.querySelector("#start-selected").onclick = () => {
   const ids = (latest.rows || []).filter((row) => canStart(row) && selected.has(row.id)).map((row) => row.id);
   ids.forEach((id) => selected.delete(id));
@@ -1007,6 +1184,10 @@ class Handler(BaseHTTPRequestHandler):
                         raise RuntimeError("Wait until the current batch finishes")
                     state["rows"] = [row for row in state["rows"] if row.get("status") == "done"]
                     save_store()
+                self._send(public_state(), 200)
+                return
+            if path == "/api/reload":
+                reload_store()
                 self._send(public_state(), 200)
                 return
             self._send({"ok": False, "error": "not found"}, 404)

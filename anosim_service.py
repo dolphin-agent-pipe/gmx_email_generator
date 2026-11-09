@@ -465,6 +465,9 @@ BOOKINGS_JS = r"""(() => {
     const copy = blob.match(/btnCopyPhoneNumber_(\d+)/);
     const cancel = blob.match(/cancelsimcardbooking\/(\d+)/);
     const cells = [...row.cells].map((td) => (td.innerText || '').replace(/\s+/g, ' ').trim());
+    const stateEl = row.querySelector('.state');
+    const stateLabel = stateEl ? stateEl.querySelector('label') : null;
+    const state = ((stateLabel || stateEl) ? (stateLabel || stateEl).innerText : '').replace(/\s+/g, ' ').trim();
     const next = row.nextElementSibling;
     let messages = [];
     if (next && /last received sms/i.test(next.innerText || '')) {
@@ -479,6 +482,7 @@ BOOKINGS_JS = r"""(() => {
       country: cells[1] || '',
       rental: cells[2] || '',
       service: cells[3] || '',
+      state,
       messages
     });
   }
@@ -1127,7 +1131,7 @@ class Dashboard:
         except (RuntimeError, TimeoutError, OSError):
             return
         if changed == "changed":
-            time.sleep(1.2)
+            time.sleep(0.4)
 
     def bookings(self) -> list[dict]:
         try:
@@ -1160,10 +1164,45 @@ class Dashboard:
                     "booking_id": str(item.get("bookingId") or ""),
                     "service": str(item.get("service") or ""),
                     "rental": str(item.get("rental") or ""),
+                    "state": str(item.get("state") or ""),
                     "messages": messages,
                 }
             )
         return rows
+
+    def grid_loading(self) -> bool:
+        expression = (
+            "(() => {"
+            " const grid = document.querySelector('#gridCurrentUsedSimCards');"
+            " if (!grid) return true;"
+            " if (grid.classList.contains('mvc-grid-loading')) return true;"
+            " if (grid.querySelector('.mvc-grid-loader, .mvc-grid-loading, .spinner-border, .spinner-grow')) return true;"
+            " const table = grid.querySelector(':scope > .mvc-grid-table > table');"
+            " return !(table && table.tBodies && table.tBodies[0]);"
+            "})()"
+        )
+        try:
+            return bool(self.evaluate(expression, timeout=10))
+        except (RuntimeError, TimeoutError, OSError):
+            return False
+
+    def wait_bookings(self) -> list[dict]:
+        self.widen_grid()
+        deadline = time.time() + 12
+        empty_reads = 0
+        while time.time() < deadline:
+            if self.grid_loading():
+                empty_reads = 0
+                time.sleep(0.4)
+                continue
+            rows = self.bookings()
+            if rows:
+                return rows
+            empty_reads += 1
+            if empty_reads >= 5:
+                return []
+            time.sleep(0.5)
+        return self.bookings()
 
     def show_dashboard(self, refresh: bool = False) -> list[dict]:
         self.ensure_browser()
@@ -1177,8 +1216,7 @@ class Dashboard:
             self.goto(DASHBOARD_URL)
         if not self.wait_css("#gridCurrentUsedSimCards", 20):
             raise SmsError("Dashboard did not load")
-        self.widen_grid()
-        return self.bookings()
+        return self.wait_bookings()
 
     def button_labels(self) -> str:
         expression = (
@@ -1384,6 +1422,9 @@ class NumberService:
     def _fresh_rows(self, rows: list[dict], snapshot: set[str], count: int) -> list[dict]:
         fresh = []
         for row in rows:
+            status = re.sub(r"[^a-z]", "", str(row.get("state") or "").lower())
+            if status in {"ended", "cancelled", "canceled", "storno", "expired"}:
+                continue
             key = digits(row["phone"])
             if not key or key in snapshot or any(same_phone(key, seen) for seen in snapshot):
                 continue
@@ -1396,6 +1437,7 @@ class NumberService:
         deadline = time.time() + timeout
         refresh = False
         found: list[dict] = []
+        reported: tuple[int, int] | None = None
         while time.time() < deadline:
             try:
                 rows = self.browser.show_dashboard(refresh=refresh)
@@ -1405,6 +1447,10 @@ class NumberService:
                 refresh = True
                 continue
             found = self._fresh_rows(rows, snapshot, count)
+            marker = (len(rows), len(found))
+            if marker != reported:
+                log(f"Dashboard shows {len(rows)} number(s), {len(found)} new")
+                reported = marker
             if len(found) >= count:
                 return found
             refresh = True

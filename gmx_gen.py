@@ -17,6 +17,7 @@ import re
 import socket
 import string
 import sys
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -1118,23 +1119,79 @@ def tweak_email(value: str) -> str:
     return local + (separator + domain if separator else "")
 
 
+def mailbox_address(value: str) -> str:
+    match = re.search(
+        r"[A-Za-z0-9._%+-]+@(?:web\.de|gmx\.net|gmx\.de|gmx\.com|gmx\.at|gmx\.ch)\b",
+        value or "",
+        re.IGNORECASE,
+    )
+    return match.group(0) if match else ""
+
+
 def visible_mailbox(cdp: Cdp, fallback: str) -> str:
     try:
         found = evaluate(
             cdp,
             "(() => {"
-            " const text = document.body ? document.body.innerText : '';"
-            " const match = text.match(/[A-Za-z0-9._%+-]+@(?:web\\.de|gmx\\.net|gmx\\.de|gmx\\.com|gmx\\.at|gmx\\.ch)/i);"
+            " const domains = 'web\\\\.de|gmx\\\\.net|gmx\\\\.de|gmx\\\\.com|gmx\\\\.at|gmx\\\\.ch';"
+            " const full = new RegExp('[A-Za-z0-9._%+-]+@(?:' + domains + ')', 'i');"
+            " const bareDomain = new RegExp('^(?:' + domains + ')$', 'i');"
+            " const localOk = (value) => /^[A-Za-z0-9._-]{1,64}$/.test(value);"
+            " const fromText = (text) => {"
+            " const match = String(text || '').match(full);"
             " return match ? match[0] : '';"
+            " };"
+            " const inputs = [...document.querySelectorAll('input, textarea')];"
+            " for (const el of inputs) {"
+            " const direct = fromText(el.value);"
+            " if (direct) return direct;"
+            " }"
+            " for (const el of inputs) {"
+            " const local = String(el.value || '').trim();"
+            " const key = ((el.id || '') + ' ' + (el.name || '') + ' ' + (el.getAttribute('data-testid') || '') + ' ' + (el.placeholder || '')).toLowerCase();"
+            " if (!localOk(local) || (el.type !== 'email' && !/mail|alias|localpart|wunsch/.test(key))) continue;"
+            " let node = el.parentElement;"
+            " for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {"
+            " const select = node.querySelector('select');"
+            " const option = select && select.options[select.selectedIndex];"
+            " const selected = String((select && select.value) || (option && option.text) || '').trim().replace(/^@/, '');"
+            " if (bareDomain.test(selected)) return local + '@' + selected;"
+            " const domain = String(node.innerText || '').match(new RegExp('@(' + domains + ')', 'i'));"
+            " if (domain) return local + '@' + domain[1];"
+            " }"
+            " }"
+            " const text = document.body ? document.body.innerText : '';"
+            " const direct = fromText(text);"
+            " if (direct) return direct;"
+            " const lines = text.split(/\\n/);"
+            " for (let i = 0; i < lines.length; i += 1) {"
+            " const joined = (lines[i] + (lines[i + 1] || '')).replace(/\\s+/g, '');"
+            " const match = fromText(joined);"
+            " if (match) return match;"
+            " }"
+            " return '';"
             "})()",
         )
     except (RuntimeError, TimeoutError):
         found = ""
-    mailbox = str(found or "").strip()
-    return mailbox or fallback
+    return mailbox_address(str(found or "")) or mailbox_address(fallback)
+
+
+def confirm_visible_email(cdp: Cdp, fallback: str) -> str:
+    captured = visible_mailbox(cdp, fallback)
+    if not click_selector(cdp, "button[aria-label='Weiter'][data-testid='next-button']"):
+        raise SystemExit("Could not find the Weiter button")
+    print("Clicked Weiter")
+    mailbox = visible_mailbox(cdp, captured or fallback)
+    if mailbox:
+        print(f"Using mailbox {mailbox}")
+    return mailbox
 
 
 def save_account(email: str, password: str) -> None:
+    email = mailbox_address(email)
+    if not email:
+        raise SystemExit("Could not save the mailbox because the address was incomplete")
     accounts: list[dict[str, str]] = []
     if ACCOUNTS_FILE.is_file():
         try:
@@ -1159,10 +1216,7 @@ def choose_email(cdp: Cdp, fallback_email: str) -> str:
             return visible_mailbox(cdp, fallback_email)
         state = weiter_state(cdp)
         if state.get("found") and not state.get("disabled") and not state.get("taken"):
-            if not click_selector(cdp, "button[aria-label='Weiter'][data-testid='next-button']"):
-                raise SystemExit("Could not find the Weiter button")
-            print("Clicked Weiter")
-            return visible_mailbox(cdp, fallback_email)
+            return confirm_visible_email(cdp, fallback_email)
         selector = email_selector(cdp)
         needs_change = bool(selector) and (state.get("taken") or (state.get("found") and state.get("disabled")))
         if needs_change and not state.get("taken"):
@@ -1172,10 +1226,7 @@ def choose_email(cdp: Cdp, fallback_email: str) -> str:
                 return visible_mailbox(cdp, fallback_email)
             state = weiter_state(cdp)
             if state.get("found") and not state.get("disabled") and not state.get("taken"):
-                if not click_selector(cdp, "button[aria-label='Weiter'][data-testid='next-button']"):
-                    raise SystemExit("Could not find the Weiter button")
-                print("Clicked Weiter")
-                return visible_mailbox(cdp, fallback_email)
+                return confirm_visible_email(cdp, fallback_email)
             needs_change = bool(email_selector(cdp)) and (state.get("taken") or (state.get("found") and state.get("disabled")))
             selector = email_selector(cdp)
         if needs_change:
@@ -1643,6 +1694,25 @@ def form_message(cdp: Cdp) -> str:
     return str(raw or "")[:240]
 
 
+def keep_browser_open(cdp: Cdp, func):
+    stop = threading.Event()
+
+    def ping() -> None:
+        while not stop.wait(5):
+            try:
+                cdp.call("Runtime.evaluate", {"expression": "1", "returnByValue": True}, timeout=10)
+            except (RuntimeError, TimeoutError, OSError):
+                return
+
+    thread = threading.Thread(target=ping, name="signup-browser-keepalive", daemon=True)
+    thread.start()
+    try:
+        return func()
+    finally:
+        stop.set()
+        thread.join(12)
+
+
 def page_url(cdp: Cdp) -> str:
     try:
         return str(evaluate(cdp, "location.href") or "")
@@ -1770,9 +1840,64 @@ def phone_number_rejected(cdp: Cdp, timeout: float = 8) -> bool:
     return registration_failed(page_url(cdp))
 
 
+def visible_consent(cdp: Cdp) -> dict | None:
+    labels = ["Zustimmen und fortfahren", "Zustimmen und weiter"]
+    found = evaluate(
+        cdp,
+        "(() => {"
+        f" const labels = {json.dumps(labels)};"
+        " const buttons = [...document.querySelectorAll(\"button[data-testid='next-button']\")];"
+        " const box = (el) => {"
+        " const r = el.getBoundingClientRect();"
+        " if (r.width < 1 || r.height < 1) return null;"
+        " return {x: r.left + r.width / 2, y: r.top + r.height / 2};"
+        " };"
+        " for (const label of labels) {"
+        " for (const el of buttons) {"
+        " const name = (el.getAttribute('aria-label') || el.innerText || '').replace(/\\s+/g, ' ').trim();"
+        " if (name !== label || !box(el)) continue;"
+        " el.scrollIntoView({block: 'center', inline: 'center'});"
+        " const point = box(el);"
+        " if (!point) continue;"
+        " return {label, x: point.x, y: point.y};"
+        " }"
+        " }"
+        " return null;"
+        "})()",
+    )
+    if not isinstance(found, dict) or not found.get("label"):
+        return None
+    return found
+
+
+def click_visible_consent(cdp: Cdp) -> str:
+    found = visible_consent(cdp)
+    if not found:
+        return ""
+    label = str(found["label"])
+    mouse_click(cdp, float(found["x"]), float(found["y"]))
+    time.sleep(0.5)
+    still = visible_consent(cdp)
+    if still and still.get("label") == label:
+        evaluate(
+            cdp,
+            "(() => {"
+            f" const label = {json.dumps(label)};"
+            " const button = [...document.querySelectorAll(\"button[data-testid='next-button']\")].find((el) => {"
+            " const name = (el.getAttribute('aria-label') || el.innerText || '').replace(/\\s+/g, ' ').trim();"
+            " const r = el.getBoundingClientRect();"
+            " return name === label && r.width > 1 && r.height > 1;"
+            " });"
+            " if (button) button.click();"
+            " return !!button;"
+            "})()",
+        )
+    print(f"Clicked {label}")
+    return label
+
+
 def submit_confirmation_code(cdp: Cdp, code: str) -> str:
     digit = "[name='confirmationCode.0.digit']"
-    consent = "button[aria-label='Zustimmen und weiter'][data-testid='next-button']"
     deadline = time.time() + 25
     while time.time() < deadline and not element_box(cdp, digit):
         time.sleep(0.4)
@@ -1784,18 +1909,24 @@ def submit_confirmation_code(cdp: Cdp, code: str) -> str:
     if not click_selector(cdp, "button[aria-label='Weiter'][data-testid='next-button']"):
         raise SystemExit("Could not find the confirmation Weiter button")
     print("Clicked Weiter")
-    print("Waiting 2s before Zustimmen und weiter")
+    print("Waiting 2s before the consent button")
     time.sleep(2)
     if registration_failed(page_url(cdp)):
         return "banned"
-    deadline = time.time() + 8
+    deadline = time.time() + 20
     while time.time() < deadline:
         if registration_failed(page_url(cdp)):
             return "banned"
-        if element_box(cdp, consent) and click_selector(cdp, consent):
-            print("Clicked Zustimmen und weiter")
-            return "accepted"
-        time.sleep(0.4)
+        current = visible_consent(cdp)
+        if not current:
+            time.sleep(0.4)
+            continue
+        label = str(current["label"])
+        click_visible_consent(cdp)
+        pause = random.uniform(5, 7)
+        print(f"Waiting {pause:.1f}s after {label}")
+        time.sleep(pause)
+        return "accepted"
     if element_box(cdp, digit):
         print("Confirmation code was rejected")
         return "rejected"
@@ -1954,7 +2085,17 @@ def fill_signup(
         verify_phone(cdp, port)
     else:
         phone_step(cdp)
-    return visible_mailbox(cdp, mailbox)
+    deadline = time.time() + 10
+    final = ""
+    while time.time() < deadline:
+        final = visible_mailbox(cdp, mailbox)
+        if final:
+            break
+        time.sleep(0.5)
+    if not final:
+        raise SystemExit("Could not read the created mailbox")
+    print(f"Created mailbox {final}")
+    return final
 
 
 def verify_supplied_phones(gmx: Cdp, phones: list[str], fetch_code, log=print, stop=None) -> str:
@@ -1977,7 +2118,12 @@ def verify_supplied_phones(gmx: Cdp, phones: list[str], fetch_code, log=print, s
                 if index == 0 and variant_index == 0:
                     raise
                 print(str(exc))
-                raise SignupRestart("The phone form closed before the numbers finished") from exc
+                try:
+                    return_to_phone_form(gmx)
+                    prepare_phone_entry(gmx, False, stop)
+                except SystemExit as back_exc:
+                    print(str(back_exc))
+                    raise SignupRestart("The phone form closed before the numbers finished") from back_exc
             if stop:
                 stop()
             selected = select_option(gmx, "#mobilePhonePrefix", prefix)
@@ -2002,7 +2148,7 @@ def verify_supplied_phones(gmx: Cdp, phones: list[str], fetch_code, log=print, s
             log(f"{number} was rejected")
             continue
         log(f"Waiting for SMS on {number}")
-        code = str(fetch_code(number) or "").strip()
+        code = str(keep_browser_open(gmx, lambda: fetch_code(number)) or "").strip()
         if not code:
             print(f"No SMS code for {number}")
             log(f"No SMS code for {number}")
