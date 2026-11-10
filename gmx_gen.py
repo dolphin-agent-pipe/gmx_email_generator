@@ -12,14 +12,17 @@ import base64
 import datetime
 import json
 import os
+import math
 import random
 import re
 import socket
 import string
+import struct
 import sys
 import threading
 import time
 import urllib.parse
+import zlib
 from pathlib import Path
 
 import requests
@@ -576,6 +579,7 @@ class Cdp:
     def __init__(self, ws: CdpSocket):
         self.ws = ws
         self._next = 0
+        self._lock = threading.Lock()
 
     def call(
         self,
@@ -584,22 +588,23 @@ class Cdp:
         timeout: float = 30,
         session_id: str | None = None,
     ) -> dict:
-        self._next += 1
-        message_id = self._next
-        self.ws.sock.settimeout(timeout)
-        payload = {"id": message_id, "method": method, "params": params or {}}
-        if session_id:
-            payload["sessionId"] = session_id
-        self.ws.send_json(payload)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            message = self.ws.recv_json()
-            if message.get("id") != message_id:
-                continue
-            if message.get("error"):
-                raise RuntimeError(f"{method} failed: {message['error']}")
-            return message.get("result") or {}
-        raise TimeoutError(method)
+        with self._lock:
+            self._next += 1
+            message_id = self._next
+            self.ws.sock.settimeout(timeout)
+            payload = {"id": message_id, "method": method, "params": params or {}}
+            if session_id:
+                payload["sessionId"] = session_id
+            self.ws.send_json(payload)
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                message = self.ws.recv_json()
+                if message.get("id") != message_id:
+                    continue
+                if message.get("error"):
+                    raise RuntimeError(f"{method} failed: {message['error']}")
+                return message.get("result") or {}
+            raise TimeoutError(method)
 
 
 def evaluate(cdp: Cdp, expression: str, session_id: str | None = None, timeout: float = 30, await_promise: bool = False):
@@ -641,6 +646,21 @@ def navigate(cdp: Cdp, url: str) -> str:
     if last:
         print(f"Opened {last}")
     raise SystemExit(f"Browser started, but {url} did not finish loading")
+
+
+def on_screen(cdp: Cdp, selector: str) -> bool:
+    found = evaluate(
+        cdp,
+        "(() => {"
+        f" const el = document.querySelector({json.dumps(selector)});"
+        " if (!el) return false;"
+        " const r = el.getBoundingClientRect();"
+        " const x = r.left + r.width / 2;"
+        " const y = r.top + r.height / 2;"
+        " return r.width > 1 && r.height > 1 && x > 0 && y > 0 && x < window.innerWidth && y < window.innerHeight;"
+        "})()",
+    )
+    return found is True
 
 
 def element_box(cdp: Cdp, selector: str, session_id: str | None = None) -> dict | None:
@@ -980,16 +1000,22 @@ def child_frames(cdp: Cdp) -> list[dict]:
     return frames
 
 
-def eval_in_frame(cdp: Cdp, frame_id: str, expression: str):
+def eval_in_frame(cdp: Cdp, frame_id: str, expression: str, await_promise: bool = False, timeout: float = 30):
     try:
-        world = cdp.call("Page.createIsolatedWorld", {"frameId": frame_id, "grantUniveralAccess": True})
+        world = cdp.call(
+            "Page.createIsolatedWorld",
+            {"frameId": frame_id, "grantUniveralAccess": True},
+            timeout=timeout,
+        )
         result = cdp.call(
             "Runtime.evaluate",
             {
                 "expression": expression,
                 "contextId": world.get("executionContextId"),
                 "returnByValue": True,
+                "awaitPromise": await_promise,
             },
+            timeout=timeout,
         )
     except (RuntimeError, TimeoutError):
         return None
@@ -1188,42 +1214,99 @@ def confirm_visible_email(cdp: Cdp, fallback: str) -> str:
     return mailbox
 
 
+_accounts_lock = threading.Lock()
+
+
+def park_broken(path: Path) -> Path | None:
+    backup = path.with_name(f"{path.stem}.broken-{time.time_ns()}{path.suffix}")
+    try:
+        path.replace(backup)
+    except OSError:
+        return None
+    return backup
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    temp.write_text(text, encoding="utf-8")
+    last: Exception | None = None
+    try:
+        for _attempt in range(5):
+            try:
+                temp.replace(path)
+                return
+            except OSError as exc:
+                last = exc
+                time.sleep(0.15)
+        raise OSError(f"Could not save {path.name}") from last
+    finally:
+        try:
+            if temp.exists():
+                temp.unlink()
+        except OSError:
+            pass
+
+
 def save_account(email: str, password: str) -> None:
     email = mailbox_address(email)
     if not email:
         raise SystemExit("Could not save the mailbox because the address was incomplete")
-    accounts: list[dict[str, str]] = []
-    if ACCOUNTS_FILE.is_file():
-        try:
-            raw = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raw = []
-        if isinstance(raw, dict):
-            raw = [raw]
-        if isinstance(raw, list):
-            accounts = [item for item in raw if isinstance(item, dict)]
-    accounts.append({"email": email, "password": password})
-    ACCOUNTS_FILE.write_text(json.dumps(accounts, indent=2), encoding="utf-8")
+    with _accounts_lock:
+        accounts: list[dict[str, str]] = []
+        if ACCOUNTS_FILE.is_file():
+            try:
+                raw = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                backup = park_broken(ACCOUNTS_FILE)
+                if backup is None:
+                    raise SystemExit(f"Could not read {ACCOUNTS_FILE.name}, so the new mailbox was not written over it") from exc
+                print(f"Could not read saved mailboxes. Kept the old file as {backup.name}.")
+                raw = []
+            if isinstance(raw, dict):
+                raw = [raw]
+            if isinstance(raw, list):
+                accounts = [item for item in raw if isinstance(item, dict)]
+        replaced = False
+        for item in accounts:
+            if str(item.get("email") or "").lower() == email.lower():
+                item["email"] = email
+                item["password"] = password
+                replaced = True
+                break
+        if not replaced:
+            accounts.append({"email": email, "password": password})
+        write_text_atomic(ACCOUNTS_FILE, json.dumps(accounts, indent=2))
     print(f"Saved {email} to {ACCOUNTS_FILE.name}")
+
+
+def chosen_mailbox(cdp: Cdp, fallback: str) -> str:
+    found = visible_mailbox(cdp, fallback)
+    if found:
+        print(f"Using mailbox {found}")
+    return found
 
 
 def choose_email(cdp: Cdp, fallback_email: str) -> str:
     deadline = time.time() + 25
     attempts = 0
     while time.time() < deadline:
-        if element_box(cdp, "#postalCode"):
+        selector = email_selector(cdp)
+        alias_open = bool(selector) and on_screen(cdp, selector)
+        if not alias_open and on_screen(cdp, "#postalCode"):
             print("Address form is already open")
-            return visible_mailbox(cdp, fallback_email)
+            return chosen_mailbox(cdp, fallback_email)
         state = weiter_state(cdp)
         if state.get("found") and not state.get("disabled") and not state.get("taken"):
             return confirm_visible_email(cdp, fallback_email)
-        selector = email_selector(cdp)
         needs_change = bool(selector) and (state.get("taken") or (state.get("found") and state.get("disabled")))
         if needs_change and not state.get("taken"):
             time.sleep(3)
-            if element_box(cdp, "#postalCode"):
+            selector = email_selector(cdp)
+            alias_open = bool(selector) and on_screen(cdp, selector)
+            if not alias_open and on_screen(cdp, "#postalCode"):
                 print("Address form is already open")
-                return visible_mailbox(cdp, fallback_email)
+                return chosen_mailbox(cdp, fallback_email)
             state = weiter_state(cdp)
             if state.get("found") and not state.get("disabled") and not state.get("taken"):
                 return confirm_visible_email(cdp, fallback_email)
@@ -1239,9 +1322,10 @@ def choose_email(cdp: Cdp, fallback_email: str) -> str:
                 type_into(cdp, selector, updated)
             except SystemExit:
                 time.sleep(1)
-                if element_box(cdp, "#postalCode"):
+                selector = email_selector(cdp)
+                if not (selector and on_screen(cdp, selector)) and on_screen(cdp, "#postalCode"):
                     print("Address form is already open")
-                    return visible_mailbox(cdp, updated if "@" in updated else fallback_email)
+                    return chosen_mailbox(cdp, updated if "@" in updated else fallback_email)
                 raise
             print(f"Email updated to {updated}")
             time.sleep(1.5)
@@ -1330,13 +1414,25 @@ def select_option(cdp: Cdp, selector: str, value: str) -> str:
     return str(selected or "")
 
 
+_usage_lock = threading.RLock()
+_usage_blocked = False
+
+
 def load_store() -> tuple[dict[str, int], list[str]]:
-    if not USAGE_FILE.is_file():
-        return {}, []
-    try:
-        raw = json.loads(USAGE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}, []
+    global _usage_blocked
+    with _usage_lock:
+        if not USAGE_FILE.is_file():
+            return {}, []
+        try:
+            raw = json.loads(USAGE_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            backup = park_broken(USAGE_FILE)
+            if backup is None:
+                _usage_blocked = True
+                print(f"Could not read {USAGE_FILE.name}. Number use counts will not be written over it.")
+            else:
+                print(f"Could not read {USAGE_FILE.name} ({exc}). Kept it as {backup.name}.")
+            return {}, []
     if not isinstance(raw, dict):
         return {}, []
     usage: dict[str, int] = {}
@@ -1353,9 +1449,13 @@ def load_store() -> tuple[dict[str, int], list[str]]:
 
 
 def save_store(usage: dict[str, int], banned: list[str]) -> None:
+    if _usage_blocked:
+        print(f"Skipped saving {USAGE_FILE.name} because the current file could not be read")
+        return
     payload: dict[str, int | list[str]] = dict(usage)
     payload["banned"] = banned
-    USAGE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    with _usage_lock:
+        write_text_atomic(USAGE_FILE, json.dumps(payload, indent=2))
 
 
 def load_usage() -> dict[str, int]:
@@ -1364,23 +1464,26 @@ def load_usage() -> dict[str, int]:
 
 
 def save_usage(usage: dict[str, int]) -> None:
-    _usage, banned = load_store()
-    save_store(usage, banned)
+    with _usage_lock:
+        _usage, banned = load_store()
+        save_store(usage, banned)
 
 
 def record_number_use(number: str) -> int:
-    usage, banned = load_store()
-    count = usage.get(number, 0) + 1
-    usage[number] = count
-    save_store(usage, banned)
-    return count
+    with _usage_lock:
+        usage, banned = load_store()
+        count = usage.get(number, 0) + 1
+        usage[number] = count
+        save_store(usage, banned)
+        return count
 
 
 def ban_number(number: str) -> None:
-    usage, banned = load_store()
-    if number not in banned:
-        banned.append(number)
-    save_store(usage, banned)
+    with _usage_lock:
+        usage, banned = load_store()
+        if number not in banned:
+            banned.append(number)
+        save_store(usage, banned)
     print(f"Banned {number}")
 
 
@@ -1489,6 +1592,20 @@ class NoPhonesLeft(Exception):
 
 class SignupRestart(Exception):
     pass
+
+
+class MailboxSettingsError(SystemExit):
+    def __init__(self, email: str, reason: str):
+        self.email = mailbox_address(email)
+        reason = reason.strip()
+        prefix = "Could not finish the created mailbox settings"
+        if reason.lower().startswith(prefix.lower()):
+            text = reason
+        else:
+            text = f"{prefix}: {reason}"
+        if self.email and self.email not in text:
+            text = f"{text} ({self.email})"
+        super().__init__(text)
 
 
 PHONE_EDIT_BUTTON = "button.mobile-phone-step__edit-inline"
@@ -1926,6 +2043,8 @@ def submit_confirmation_code(cdp: Cdp, code: str) -> str:
         pause = random.uniform(5, 7)
         print(f"Waiting {pause:.1f}s after {label}")
         time.sleep(pause)
+        print("Opening mailbox settings")
+        enable_mailbox_access(cdp)
         return "accepted"
     if element_box(cdp, digit):
         print("Confirmation code was rejected")
@@ -2002,6 +2121,942 @@ def verify_phone(gmx: Cdp, port: int) -> None:
                 continue
     finally:
         anosim_socket.close()
+
+
+def mail_session(cdp: Cdp) -> str | None:
+    saved = getattr(cdp, "_mail_session", None)
+    if saved:
+        return str(saved)
+    try:
+        payload = cdp.call("Target.getTargets")
+    except (RuntimeError, TimeoutError):
+        return None
+    for info in payload.get("targetInfos") or []:
+        url = str(info.get("url") or "").lower()
+        if not any(part in url for part in ("weblink.", "webmailer.")) or not info.get("targetId"):
+            continue
+        try:
+            attached = cdp.call("Target.attachToTarget", {"targetId": info["targetId"], "flatten": True})
+        except (RuntimeError, TimeoutError):
+            continue
+        session_id = attached.get("sessionId")
+        if session_id:
+            cdp._mail_session = str(session_id)
+            return str(session_id)
+    return None
+
+
+def mail_offset(cdp: Cdp) -> tuple[float, float]:
+    offset = evaluate(
+        cdp,
+        "(() => {"
+        " const frame = [...document.querySelectorAll('iframe')].find((el) => { const src = el.src || ''; return src.includes('weblink.') || src.includes('webmailer.'); });"
+        " if (!frame) return null;"
+        " const r = frame.getBoundingClientRect();"
+        " if (r.width < 20 || r.height < 20) return null;"
+        " return {left: r.left, top: r.top};"
+        "})()",
+    )
+    if not isinstance(offset, dict):
+        return 0.0, 0.0
+    return float(offset.get("left") or 0), float(offset.get("top") or 0)
+
+
+def shift_box(box: dict, dx: float, dy: float) -> dict:
+    moved = dict(box)
+    for key in ("x", "y", "left", "top"):
+        if key in moved:
+            moved[key] = float(moved[key]) + (dx if key in {"x", "left"} else dy)
+    return moved
+
+
+def control_box(cdp: Cdp, selector: str, text: str = "") -> dict | None:
+    expression = (
+        "(() => {"
+        f" const selector = {json.dumps(selector)};"
+        f" const text = {json.dumps(text)};"
+        " const norm = (el) => ((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).replace(/\\s+/g, ' ').trim();"
+        " const point = (el) => {"
+        " el.scrollIntoView({block: 'center', inline: 'center'});"
+        " const r = el.getBoundingClientRect();"
+        " if (r.width < 2 || r.height < 2) return null;"
+        " const x = r.left + r.width / 2;"
+        " const y = r.top + r.height / 2;"
+        " if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) return null;"
+        " return {x, y, left: r.left, top: r.top, width: r.width, height: r.height};"
+        " };"
+        " const matches = (el) => !text || norm(el) === text || norm(el).includes(text);"
+        " const visit = (root) => {"
+        " const nodes = [...(root.querySelectorAll?.(selector) || [])];"
+        " for (const el of nodes) {"
+        " if (!matches(el)) continue;"
+        " const found = point(el);"
+        " if (found) return found;"
+        " }"
+        " for (const node of root.querySelectorAll?.('*') || []) {"
+        " if (!node.shadowRoot) continue;"
+        " const nested = visit(node.shadowRoot);"
+        " if (nested) return nested;"
+        " }"
+        " return null;"
+        " };"
+        " const direct = visit(document);"
+        " if (direct) return direct;"
+        " for (const frame of document.querySelectorAll('iframe')) {"
+        " let doc = null;"
+        " try { doc = frame.contentDocument; } catch (error) { continue; }"
+        " if (!doc) continue;"
+        " const inner = visit(doc);"
+        " if (!inner) continue;"
+        " const outer = frame.getBoundingClientRect();"
+        " return {x: outer.left + inner.x, y: outer.top + inner.y, left: outer.left + inner.left, top: outer.top + inner.top, width: inner.width, height: inner.height};"
+        " }"
+        " return null;"
+        "})()"
+    )
+    found = evaluate(cdp, expression)
+    if isinstance(found, dict):
+        return found
+    local_script = (
+        "(() => {"
+        f" const selector = {json.dumps(selector)};"
+        f" const text = {json.dumps(text)};"
+        " const norm = (el) => ((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).replace(/\\s+/g, ' ').trim();"
+        " const matches = (el) => !text || norm(el) === text || norm(el).includes(text);"
+        " const point = (el) => {"
+        " const r = el.getBoundingClientRect();"
+        " if (r.width < 2 || r.height < 2) return null;"
+        " return {x: r.left + r.width / 2, y: r.top + r.height / 2, left: r.left, top: r.top, width: r.width, height: r.height};"
+        " };"
+        " const visit = (root) => {"
+        " for (const el of root.querySelectorAll?.(selector) || []) {"
+        " if (!matches(el)) continue;"
+        " const found = point(el);"
+        " if (found) return found;"
+        " }"
+        " for (const node of root.querySelectorAll?.('*') || []) {"
+        " if (!node.shadowRoot) continue;"
+        " const nested = visit(node.shadowRoot);"
+        " if (nested) return nested;"
+        " }"
+        " return null;"
+        " };"
+        " return visit(document);"
+        "})()"
+    )
+    frames = child_frames(cdp)
+    root_id = str((frames[0] if frames else {}).get("id") or "")
+    for frame in frames:
+        frame_url = str(frame.get("url") or "")
+        local = eval_in_frame(cdp, str(frame.get("id")), local_script)
+        if not isinstance(local, dict):
+            continue
+        if str(frame.get("id") or "") == root_id:
+            return local
+        host = "webmailer." if "webmailer." in frame_url else "weblink." if "weblink." in frame_url else ""
+        if host:
+            overlay = evaluate(
+                cdp,
+                "(() => {"
+                f" const frame = [...document.querySelectorAll('iframe')].find((el) => (el.src || '').includes({json.dumps(host)}));"
+                " if (!frame) return null;"
+                " const r = frame.getBoundingClientRect();"
+                " if (r.width < 20 || r.height < 20) return null;"
+                " return {left: r.left, top: r.top};"
+                "})()",
+            )
+            if isinstance(overlay, dict):
+                return shift_box(local, float(overlay["left"]), float(overlay["top"]))
+        overlays = evaluate(
+            cdp,
+            "(() => [...document.querySelectorAll('iframe')].map((frame) => {"
+            " const r = frame.getBoundingClientRect();"
+            " return {left: r.left, top: r.top, width: r.width, height: r.height};"
+            " }).filter((r) => r.width > 20 && r.height > 20))()",
+        )
+        if isinstance(overlays, list):
+            for overlay in overlays:
+                if not isinstance(overlay, dict):
+                    continue
+                if float(local["x"]) <= float(overlay["width"]) and float(local["y"]) <= float(overlay["height"]):
+                    return {
+                        "x": float(overlay["left"]) + float(local["x"]),
+                        "y": float(overlay["top"]) + float(local["y"]),
+                        "left": float(overlay["left"]) + float(local["left"]),
+                        "top": float(overlay["top"]) + float(local["top"]),
+                        "width": float(local["width"]),
+                        "height": float(local["height"]),
+                    }
+    session_id = mail_session(cdp)
+    if session_id:
+        local = evaluate(cdp, local_script, session_id=session_id)
+        if isinstance(local, dict):
+            dx, dy = mail_offset(cdp)
+            return shift_box(local, dx, dy)
+    return None
+
+
+def click_control(
+    cdp: Cdp,
+    selector: str,
+    text: str = "",
+    timeout: float = 8,
+    required: bool = False,
+    label: str = "",
+) -> bool:
+    deadline = time.time() + timeout
+    label = label or text or selector
+    while time.time() < deadline:
+        try:
+            box = control_box(cdp, selector, text)
+        except (RuntimeError, TimeoutError):
+            box = None
+        if box:
+            mouse_click(cdp, float(box["x"]), float(box["y"]))
+            print(f"Clicked {label}")
+            time.sleep(0.8)
+            return True
+        time.sleep(0.35)
+    if required:
+        if selector == "button.label":
+            for frame in child_frames(cdp):
+                raw = eval_in_frame(
+                    cdp,
+                    str(frame.get("id")),
+                    "(() => [...document.querySelectorAll('button.label')].map((el) => (el.innerText || '').replace(/\\s+/g, ' ').trim()).filter(Boolean).slice(0, 12).join(' | '))()",
+                )
+                if raw:
+                    print("LABELS", str(frame.get("url") or "")[:80], str(raw).encode("ascii", "replace").decode()[:300])
+        raise SystemExit(f"Could not find {label}")
+    return False
+
+
+def click_mailbox_prompt(cdp: Cdp) -> str:
+    expression = (
+        "(() => {"
+        " const prompts = ["
+        " ['#save-all-pur, button[aria-label=\"Akzeptieren und weiter\"]', 'Akzeptieren und weiter'],"
+        " ['#cta, button[data-component-path=\"accept-button\"]', 'Zustimmen und weiter'],"
+        " ['button.layer-accept-all, button[data-component-path=\"acceptall-button\"]', 'Beiden zustimmen und weiter'],"
+        " ['button.lux-close-button[title=\"Schließen\"], button[data-component-path=\"icon.x\"][title=\"Schließen\"]', 'Schließen']"
+        " ];"
+        " const norm = (el) => ((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')).replace(/\\s+/g, ' ').trim();"
+        " const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1; };"
+        " const visit = (root) => {"
+        " for (const [selector, label] of prompts) {"
+        " for (const el of root.querySelectorAll?.(selector) || []) {"
+        " if (!visible(el) || !norm(el).includes(label)) continue;"
+        " el.click();"
+        " return label;"
+        " }"
+        " }"
+        " for (const node of root.querySelectorAll?.('*') || []) {"
+        " if (!node.shadowRoot) continue;"
+        " const found = visit(node.shadowRoot);"
+        " if (found) return found;"
+        " }"
+        " return '';"
+        " };"
+        " return visit(document);"
+        "})()"
+    )
+    for frame in child_frames(cdp):
+        found = eval_in_frame(cdp, str(frame.get("id")), expression)
+        if isinstance(found, str) and found:
+            print(f"Clicked {found}")
+            return found
+    return ""
+
+
+def dismiss_mailbox_prompts(cdp: Cdp, seconds: float = 12) -> None:
+    deadline = time.time() + seconds
+    idle = 0
+    while time.time() < deadline:
+        if click_mailbox_prompt(cdp):
+            idle = 0
+            time.sleep(1.0)
+            continue
+        idle += 1
+        if idle >= 3:
+            return
+        time.sleep(0.4)
+
+
+POP3_SWITCH_JS = (
+    "(() => {"
+    " const find = (root) => {"
+    " const input = root.querySelector?.(\"input[data-webdriver='pop3imap-access-toggle']\");"
+    " if (input) return input;"
+    " for (const node of root.querySelectorAll?.('*') || []) {"
+    " if (!node.shadowRoot) continue;"
+    " const nested = find(node.shadowRoot);"
+    " if (nested) return nested;"
+    " }"
+    " return null;"
+    " };"
+    " const input = find(document);"
+    " if (!input) return null;"
+    " const target = input.getBoundingClientRect().width > 8 ? input : (input.closest('label') || input.parentElement || input);"
+    " target.scrollIntoView({block: 'center', inline: 'center'});"
+    " const r = target.getBoundingClientRect();"
+    " if (r.width < 2 || r.height < 2) return null;"
+    " return {checked: !!input.checked, x: r.left + r.width / 2, y: r.top + r.height / 2};"
+    "})()"
+)
+
+
+def pop3_switch(cdp: Cdp) -> dict | None:
+    found = evaluate(cdp, POP3_SWITCH_JS)
+    if isinstance(found, dict):
+        return found
+    for frame in child_frames(cdp):
+        local = eval_in_frame(cdp, str(frame.get("id")), POP3_SWITCH_JS)
+        if not isinstance(local, dict):
+            continue
+        overlays = evaluate(
+            cdp,
+            "(() => [...document.querySelectorAll('iframe')].map((frame) => {"
+            " const r = frame.getBoundingClientRect();"
+            " return {left: r.left, top: r.top, width: r.width, height: r.height};"
+            " }).filter((r) => r.width > 20 && r.height > 20))()",
+        )
+        if not isinstance(overlays, list):
+            return local
+        for overlay in overlays:
+            if not isinstance(overlay, dict):
+                continue
+            if float(local["x"]) <= float(overlay["width"]) and float(local["y"]) <= float(overlay["height"]):
+                return {
+                    "checked": local.get("checked"),
+                    "x": float(overlay["left"]) + float(local["x"]),
+                    "y": float(overlay["top"]) + float(local["y"]),
+                }
+        return local
+    session_id = mail_session(cdp)
+    if session_id:
+        local = evaluate(cdp, POP3_SWITCH_JS, session_id=session_id)
+        if isinstance(local, dict):
+            dx, dy = mail_offset(cdp)
+            return {"checked": local.get("checked"), "x": float(local["x"]) + dx, "y": float(local["y"]) + dy}
+    return None
+
+
+def captcha_surface(cdp: Cdp) -> tuple[str | None, float, float] | None:
+    frame = element_box(cdp, "iframe[src*='captchafox'], #captchafox iframe, iframe[src*='captcha']")
+    if frame:
+        return captcha_frame_session(cdp), float(frame["left"]), float(frame["top"])
+    if element_box(cdp, "#captchafox, .captchafox"):
+        return None, 0.0, 0.0
+    session_id = mail_session(cdp)
+    if session_id:
+        dx, dy = mail_offset(cdp)
+        inner = element_box(cdp, "iframe[src*='captchafox'], #captchafox iframe, iframe[src*='captcha']", session_id=session_id)
+        if inner:
+            return captcha_frame_session(cdp), dx + float(inner["left"]), dy + float(inner["top"])
+        if element_box(cdp, "#captchafox, .captchafox", session_id=session_id):
+            return None, dx, dy
+    return None
+
+
+def challenge_layout(cdp: Cdp, session_id: str | None) -> dict:
+    layout = evaluate(
+        cdp,
+        "(() => {"
+        " const rect = (el) => {"
+        " const r = el.getBoundingClientRect();"
+        " return {x: r.left + r.width / 2, y: r.top + r.height / 2, left: r.left, top: r.top, width: r.width, height: r.height};"
+        " };"
+        " const icons = [...document.querySelectorAll('img, svg, canvas, span, div')].filter((el) => {"
+        " const r = el.getBoundingClientRect();"
+        " if (r.width < 18 || r.height < 18 || r.width > 170 || r.height > 170) return false;"
+        " const text = (el.innerText || '').trim();"
+        " const media = ['IMG', 'SVG', 'CANVAS'].includes(el.tagName) || !!el.querySelector?.('img, svg, canvas');"
+        " const emoji = text.length > 0 && text.length <= 4;"
+        " return media || emoji;"
+        " }).slice(0, 10).map(rect);"
+        " const handle = [...document.querySelectorAll('button, [role=slider]')].find((el) => /schieben|slide/i.test((el.innerText || '') + ' ' + (el.getAttribute('aria-label') || '')));"
+        " const track = handle ? (handle.parentElement || handle) : null;"
+        " return {icons, handle: handle ? rect(handle) : null, track: track ? rect(track) : null};"
+        "})()",
+        session_id=session_id,
+    )
+    return layout if isinstance(layout, dict) else {}
+
+
+def icon_pair(icons: list) -> tuple[dict, dict] | None:
+    best: tuple[float, dict, dict] | None = None
+    points = [item for item in icons if isinstance(item, dict)]
+    for index, left in enumerate(points):
+        for right in points[index + 1 :]:
+            if abs(float(left["y"]) - float(right["y"])) > 46:
+                continue
+            gap = abs(float(left["x"]) - float(right["x"]))
+            if gap < 24:
+                continue
+            if best is None or gap > best[0]:
+                best = (gap, left, right)
+    if best is None:
+        return None
+    ordered = sorted((best[1], best[2]), key=lambda item: float(item["x"]))
+    return ordered[0], ordered[1]
+
+
+def mouse_down(cdp: Cdp, x: float, y: float) -> None:
+    cdp.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        {"type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1},
+    )
+
+
+def mouse_move(cdp: Cdp, x: float, y: float) -> None:
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        {"type": "mouseMoved", "x": x, "y": y, "button": "left", "buttons": 1},
+    )
+
+
+def mouse_up(cdp: Cdp, x: float, y: float) -> None:
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        {"type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1},
+    )
+
+
+def solve_slide_captcha(cdp: Cdp) -> bool:
+    surface = captcha_surface(cdp)
+    if surface is None:
+        return False
+    session_id, origin_x, origin_y = surface
+    print("Solving the slide captcha")
+    layout = challenge_layout(cdp, session_id)
+    handle = layout.get("handle") if isinstance(layout.get("handle"), dict) else None
+    track = layout.get("track") if isinstance(layout.get("track"), dict) else None
+    if not handle:
+        return False
+    pair = icon_pair(layout.get("icons") or [])
+    target_x = float(pair[1]["x"]) if pair else None
+    grab_x = origin_x + float(handle["left"]) + min(22, float(handle["width"]) / 3)
+    grab_y = origin_y + float(handle["y"])
+    limit = origin_x + float((track or handle)["left"]) + float((track or handle)["width"]) - 10
+    mouse_down(cdp, grab_x, grab_y)
+    x = grab_x
+    aligned = False
+    try:
+        while x < limit:
+            x = min(limit, x + 7)
+            mouse_move(cdp, x, grab_y)
+            time.sleep(0.03)
+            if target_x is None:
+                continue
+            moved = challenge_layout(cdp, session_id)
+            current = icon_pair(moved.get("icons") or [])
+            if current and abs(float(current[0]["x"]) - target_x) <= 16:
+                aligned = True
+                break
+    finally:
+        mouse_up(cdp, x, grab_y)
+    if aligned:
+        print("Moved the slide captcha onto the target")
+    return aligned or captcha_surface(cdp) is None
+
+
+def describe_settings(cdp: Cdp) -> None:
+    for frame in child_frames(cdp):
+        url = str(frame.get("url") or "")
+        if not any(part in url for part in ("webmailer.", "weblink.", "mail_settings", "permission")):
+            continue
+        raw = eval_in_frame(
+            cdp,
+            str(frame.get("id")),
+            "(() => {"
+            " const bits = [];"
+            " const visit = (root, depth) => {"
+            " if (depth > 3) return;"
+            " for (const el of root.querySelectorAll?.('button, a, input, label') || []) {"
+            " const text = ((el.innerText || el.getAttribute('aria-label') || el.getAttribute('data-webdriver') || el.id || '') + '').replace(/\\s+/g, ' ').trim().slice(0, 60);"
+            " if (text) bits.push(text);"
+            " }"
+            " for (const el of root.querySelectorAll?.('*') || []) if (el.shadowRoot) visit(el.shadowRoot, depth + 1);"
+            " };"
+            " visit(document, 0);"
+            " const frames = [...document.querySelectorAll('iframe')].map((frame) => (frame.src || frame.id || 'iframe').slice(0, 100));"
+            " if (!bits.length && !frames.length) return '';"
+            " return bits.slice(0, 30).join(' | ') + ' || ' + frames.join(' | ');"
+            "})()",
+        )
+        if raw:
+            print("SETTINGS", url[:120])
+            print(str(raw).encode("ascii", "replace").decode()[:700])
+
+
+def enable_pop3(cdp: Cdp) -> None:
+    if hasattr(cdp, "_mail_session"):
+        delattr(cdp, "_mail_session")
+    deadline = time.time() + 20
+    switch = None
+    while time.time() < deadline:
+        switch = pop3_switch(cdp)
+        if switch:
+            break
+        time.sleep(0.4)
+    if not switch:
+        describe_settings(cdp)
+        raise SystemExit("Could not find the POP3/IMAP switch")
+    if switch.get("checked"):
+        print("POP3/IMAP access is already on")
+        return
+    mouse_click(cdp, float(switch["x"]), float(switch["y"]))
+    print("Clicked the POP3/IMAP switch")
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        current = pop3_switch(cdp)
+        if current and current.get("checked"):
+            print("POP3/IMAP access is on")
+            return
+        if captcha_surface(cdp):
+            break
+        time.sleep(0.4)
+    if captcha_surface(cdp):
+        if not solve_slide_captcha(cdp):
+            try:
+                click_human_check(cdp)
+            except SystemExit:
+                print("The POP3/IMAP captcha is still open")
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        current = pop3_switch(cdp)
+        if current and current.get("checked"):
+            print("POP3/IMAP access is on")
+            return
+        time.sleep(0.4)
+    raise SystemExit("Could not turn on POP3/IMAP access")
+
+
+def mailset_frames(cdp: Cdp) -> list[dict]:
+    return [frame for frame in child_frames(cdp) if "mailset-root." in str(frame.get("url") or "")]
+
+
+def click_mailset_button(cdp: Cdp, label: str) -> bool:
+    expression = (
+        "(() => {"
+        f" const label = {json.dumps(label)};"
+        " let found = null;"
+        " const visit = (root) => {"
+        " for (const el of root.querySelectorAll?.('button.label') || []) {"
+        " if ((el.innerText || '').replace(/\\s+/g, ' ').trim() === label) found = el;"
+        " }"
+        " for (const el of root.querySelectorAll?.('*') || []) if (el.shadowRoot) visit(el.shadowRoot);"
+        " };"
+        " visit(document);"
+        " if (!found) return false;"
+        " found.click();"
+        " return true;"
+        "})()"
+    )
+    for frame in mailset_frames(cdp):
+        if eval_in_frame(cdp, str(frame.get("id")), expression) is True:
+            print(f"Clicked {label}")
+            return True
+    return False
+
+
+def mailset_origin(cdp: Cdp, frame: dict) -> tuple[float, float]:
+    parent_id = str(frame.get("parentId") or "")
+    if not parent_id:
+        return 0.0, 0.0
+    box = eval_in_frame(
+        cdp,
+        parent_id,
+        "(() => {"
+        " let found = document.querySelector('#thirdPartyFrame_mail_settings, iframe[src*=\"mailset-root.\"]');"
+        " const visit = (root) => {"
+        " for (const el of root.querySelectorAll?.('iframe') || []) if ((el.src || '').includes('mailset-root.')) found = el;"
+        " for (const el of root.querySelectorAll?.('*') || []) if (el.shadowRoot) visit(el.shadowRoot);"
+        " };"
+        " if (!found) visit(document);"
+        " if (!found) return null;"
+        " const r = found.getBoundingClientRect();"
+        " return {left: r.left, top: r.top};"
+        "})()",
+    )
+    if not isinstance(box, dict):
+        return 0.0, 0.0
+    return float(box.get("left") or 0), float(box.get("top") or 0)
+
+
+def mailset_pop3_state(cdp: Cdp) -> tuple[dict, dict] | None:
+    for frame in mailset_frames(cdp):
+        local = eval_in_frame(cdp, str(frame.get("id")), POP3_SWITCH_JS)
+        if isinstance(local, dict):
+            return frame, local
+    return None
+
+
+def mailset_slide(cdp: Cdp, frame_id: str) -> dict | None:
+    layout = eval_in_frame(
+        cdp,
+        frame_id,
+        "(() => {"
+        " const rect = (el) => { const r = el.getBoundingClientRect(); return {left: r.left, top: r.top, width: r.width, height: r.height, x: r.left + r.width / 2, y: r.top + r.height / 2}; };"
+        " let button = null, slider = null;"
+        " const icons = [];"
+        " const visit = (root) => {"
+        " for (const el of root.querySelectorAll?.('.cf-challenge, .cf-challenge *') || []) {"
+        " const cls = String(el.className || '');"
+        " const r = el.getBoundingClientRect();"
+        " if (cls.includes('cf-slider__button') && r.width > 8) button = rect(el);"
+        " else if (cls.split(' ').includes('cf-slider') && r.width > 40) slider = rect(el);"
+        " else if (!cls.includes('cf-slider') && !cls.includes('cf-challenge__button') && r.width >= 24 && r.height >= 24 && r.width <= 150 && r.height <= 150) icons.push(rect(el));"
+        " }"
+        " for (const el of root.querySelectorAll?.('*') || []) if (el.shadowRoot) visit(el.shadowRoot);"
+        " };"
+        " visit(document);"
+        " if (!button || !slider) return null;"
+        " return {button, slider, icons: icons.slice(0, 8)};"
+        "})()",
+    )
+    return layout if isinstance(layout, dict) else None
+
+
+def decode_png(data: bytes) -> tuple[int, int, list[bytearray], int] | None:
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+    offset = 8
+    width = height = color = 0
+    compressed = b""
+    while offset + 8 <= len(data):
+        length = struct.unpack(">I", data[offset : offset + 4])[0]
+        kind = data[offset + 4 : offset + 8]
+        chunk = data[offset + 8 : offset + 8 + length]
+        offset += 12 + length
+        if kind == b"IHDR":
+            width, height, depth, color, compression, png_filter, interlace = struct.unpack(">IIBBBBB", chunk)
+            if depth != 8 or compression or png_filter or interlace:
+                return None
+        elif kind == b"IDAT":
+            compressed += chunk
+        elif kind == b"IEND":
+            break
+    if not compressed or color not in {2, 6} or width < 2 or height < 2:
+        return None
+    raw = zlib.decompress(compressed)
+    channels = 3 if color == 2 else 4
+    stride = width * channels
+    if len(raw) < height * (stride + 1):
+        return None
+
+    def paeth(left: int, up: int, upper_left: int) -> int:
+        estimate = left + up - upper_left
+        if abs(estimate - left) <= abs(estimate - up) and abs(estimate - left) <= abs(estimate - upper_left):
+            return left
+        if abs(estimate - up) <= abs(estimate - upper_left):
+            return up
+        return upper_left
+
+    rows: list[bytearray] = []
+    index = 0
+    for _y in range(height):
+        filter_type = raw[index]
+        index += 1
+        row = bytearray(raw[index : index + stride])
+        index += stride
+        previous = rows[-1] if rows else bytearray(stride)
+        if filter_type == 1:
+            for pixel_index in range(stride):
+                left = row[pixel_index - channels] if pixel_index >= channels else 0
+                row[pixel_index] = (row[pixel_index] + left) & 255
+        elif filter_type == 2:
+            for pixel_index in range(stride):
+                row[pixel_index] = (row[pixel_index] + previous[pixel_index]) & 255
+        elif filter_type == 3:
+            for pixel_index in range(stride):
+                left = row[pixel_index - channels] if pixel_index >= channels else 0
+                row[pixel_index] = (row[pixel_index] + ((left + previous[pixel_index]) // 2)) & 255
+        elif filter_type == 4:
+            for pixel_index in range(stride):
+                left = row[pixel_index - channels] if pixel_index >= channels else 0
+                upper_left = previous[pixel_index - channels] if pixel_index >= channels else 0
+                row[pixel_index] = (row[pixel_index] + paeth(left, previous[pixel_index], upper_left)) & 255
+        rows.append(row)
+    return width, height, rows, channels
+
+
+def slide_gap_css(data: bytes, css_width: float, ignore_left: float = 40) -> float | None:
+    decoded = decode_png(data)
+    if decoded is None or css_width < 80:
+        return None
+    width, height, rows, channels = decoded
+    piece = max(12, int(round(50 * width / css_width)))
+    start = max(2, int(round(ignore_left * width / css_width)))
+    stop = width - piece - 2
+    if stop <= start:
+        return None
+    y0 = max(0, height // 8)
+    y1 = height - y0
+    if y1 <= y0:
+        y0, y1 = 0, height
+    energy = [0.0] * width
+    shade = [0.0] * width
+    for y in range(y0, y1):
+        row = rows[y]
+        for x in range(width):
+            offset = x * channels
+            shade[x] += row[offset] * 0.299 + row[offset + 1] * 0.587 + row[offset + 2] * 0.114
+        for x in range(1, width - 1):
+            left = (x - 1) * channels
+            right = (x + 1) * channels
+            energy[x] += abs(int(row[right]) - int(row[left])) + abs(int(row[right + 1]) - int(row[left + 1])) + abs(int(row[right + 2]) - int(row[left + 2]))
+    samples = max(1, y1 - y0)
+    shade = [value / samples for value in shade]
+    smooth = energy[:]
+    for x in range(2, width - 2):
+        smooth[x] = sum(energy[x - 2 : x + 3]) / 5
+    def peak(x: int) -> float:
+        return smooth[x] - (smooth[max(0, x - 8)] + smooth[min(width - 1, x + 8)]) / 2
+
+    best: tuple[float, int] | None = None
+    for left in range(start, stop):
+        right = min(width - 2, left + piece)
+        score = max(0.0, peak(left)) + max(0.0, peak(right))
+        interior = sum(shade[left + 3 : right - 3]) / max(1, right - left - 6)
+        before = sum(shade[max(0, left - 14) : max(0, left - 2)]) / max(1, max(0, left - 2) - max(0, left - 14))
+        after = sum(shade[right + 2 : right + 14]) / max(1, min(width, right + 14) - (right + 2))
+        if interior + 6 < before and interior + 6 < after:
+            score += samples * 12
+        if best is None or score > best[0]:
+            best = (score, left)
+    if best is None:
+        return None
+    css_x = best[1] * css_width / width
+    if css_x < ignore_left or css_x > css_width - 52:
+        return None
+    return css_x
+
+
+def slide_background(cdp: Cdp, frame_id: str, origin_x: float, origin_y: float) -> tuple[bytes, float, float] | None:
+    found = eval_in_frame(
+        cdp,
+        frame_id,
+        "(() => {"
+        " let bg = null;"
+        " const visit = (root) => {"
+        " for (const el of root.querySelectorAll?.('canvas') || []) {"
+        " const r = el.getBoundingClientRect();"
+        " if (r.width < 200 || r.height < 45 || r.height > 100) continue;"
+        " if (getComputedStyle(el).position === 'absolute') bg = el;"
+        " }"
+        " for (const el of root.querySelectorAll?.('*') || []) if (el.shadowRoot) visit(el.shadowRoot);"
+        " };"
+        " visit(document);"
+        " if (!bg) return null;"
+        " const r = bg.getBoundingClientRect();"
+        " let png = '';"
+        " try { png = bg.toDataURL('image/png'); } catch (error) { png = ''; }"
+        " return {png, left: r.left, top: r.top, width: r.width, height: r.height};"
+        "})()",
+    )
+    if not isinstance(found, dict):
+        return None
+    css_width = float(found.get("width") or 0)
+    if css_width < 80:
+        return None
+    encoded = str(found.get("png") or "")
+    if encoded.startswith("data:image/png"):
+        payload = encoded.split(",", 1)[1] if "," in encoded else ""
+        try:
+            return base64.b64decode(payload), css_width, 40.0
+        except (ValueError, IndexError):
+            pass
+    try:
+        shot = cdp.call(
+            "Page.captureScreenshot",
+            {
+                "format": "png",
+                "clip": {
+                    "x": origin_x + float(found["left"]),
+                    "y": origin_y + float(found["top"]),
+                    "width": css_width,
+                    "height": float(found["height"]),
+                    "scale": 1,
+                },
+            },
+        )
+    except (RuntimeError, TimeoutError, KeyError):
+        return None
+    data = base64.b64decode(shot.get("data") or "")
+    if not data:
+        return None
+    return data, css_width, 58.0
+
+
+def drag_pointer(cdp: Cdp, x0: float, y0: float, x1: float, y1: float) -> None:
+    mouse_down(cdp, x0, y0)
+    steps = 28
+    try:
+        for step in range(1, steps + 1):
+            t = step / steps
+            ease = t * t * (3 - 2 * t)
+            mouse_move(cdp, x0 + (x1 - x0) * ease, y0 + math.sin(t * math.pi) * 1.2)
+            time.sleep(0.016 + random.random() * 0.012)
+        time.sleep(0.12)
+    finally:
+        mouse_up(cdp, x1, y0)
+
+
+def drag_mailset_slide(cdp: Cdp, frame_id: str, origin_x: float, origin_y: float) -> None:
+    picture = None
+    for _ in range(4):
+        picture = slide_background(cdp, frame_id, origin_x, origin_y)
+        if picture is not None:
+            break
+        time.sleep(0.35)
+    if picture is None:
+        print("Could not see the slide picture")
+        return
+    data, css_width, ignore_left = picture
+    gap = slide_gap_css(data, css_width, ignore_left)
+    if gap is None:
+        print("Could not see the slide gap")
+        return
+    gap = max(12.0, min(248.0, gap))
+    print("Solving the slide captcha")
+    layout = mailset_slide(cdp, frame_id)
+    if layout is None:
+        print("Could not move the slide handle")
+        return
+    button = layout["button"]
+    grab_x = origin_x + float(button["x"])
+    grab_y = origin_y + float(button["y"])
+    drag_pointer(cdp, grab_x, grab_y, grab_x + gap, grab_y)
+    print(f"Slid the captcha {gap:.0f}px")
+
+
+def pop3_is_on(cdp: Cdp) -> bool:
+    current = mailset_pop3_state(cdp)
+    if current and current[1].get("checked"):
+        print("POP3/IMAP access is on")
+        return True
+    return False
+
+
+def turn_mailset_pop3_on(cdp: Cdp) -> bool:
+    found = None
+    deadline = time.time() + 15
+    while time.time() < deadline and found is None:
+        found = mailset_pop3_state(cdp)
+        if found is None:
+            time.sleep(0.4)
+    if found is None:
+        return False
+    if found[1].get("checked"):
+        print("POP3/IMAP access is on")
+        return True
+    for attempt in range(3):
+        found = mailset_pop3_state(cdp)
+        if found is None:
+            return False
+        frame, switch = found
+        if switch.get("checked"):
+            print("POP3/IMAP access is on")
+            return True
+        origin_x, origin_y = mailset_origin(cdp, frame)
+        frame_id = str(frame.get("id"))
+        if mailset_slide(cdp, frame_id) is None:
+            mouse_click(cdp, origin_x + float(switch["x"]), origin_y + float(switch["y"]))
+            print("Clicked the POP3/IMAP switch")
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                if pop3_is_on(cdp):
+                    return True
+                if mailset_slide(cdp, frame_id):
+                    break
+                time.sleep(0.4)
+        if mailset_slide(cdp, frame_id):
+            drag_mailset_slide(cdp, frame_id, origin_x, origin_y)
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            if pop3_is_on(cdp):
+                return True
+            time.sleep(0.4)
+        if attempt < 2:
+            print("POP3/IMAP slide was not accepted")
+            time.sleep(0.8)
+    return False
+
+
+def click_settings_button(cdp: Cdp) -> bool:
+    expression = (
+        "(() => {"
+        " const visit = (root) => {"
+        " const el = root.querySelector?.('#settingsButton');"
+        " if (el) return el;"
+        " for (const node of root.querySelectorAll?.('*') || []) {"
+        " if (!node.shadowRoot) continue;"
+        " const found = visit(node.shadowRoot);"
+        " if (found) return found;"
+        " }"
+        " return null;"
+        " };"
+        " const el = visit(document);"
+        " if (!el) return false;"
+        " el.click();"
+        " return true;"
+        "})()"
+    )
+    for frame in child_frames(cdp):
+        url = str(frame.get("url") or "")
+        if "webmailer." not in url and "weblink." not in url:
+            continue
+        if eval_in_frame(cdp, str(frame.get("id")), expression) is True:
+            print(f"Settings button in {url[:100]}")
+            return True
+    session_id = mail_session(cdp)
+    if session_id and evaluate(cdp, expression, session_id=session_id) is True:
+        print("Settings button in the mail session")
+        return True
+    return False
+
+
+def enable_mailbox_access(cdp: Cdp) -> None:
+    dismiss_mailbox_prompts(cdp)
+    deadline = time.time() + 45
+    clicked_at = 0.0
+    while time.time() < deadline and not mailset_frames(cdp):
+        if click_mailbox_prompt(cdp):
+            time.sleep(1.0)
+            continue
+        if time.time() - clicked_at >= 6:
+            if click_settings_button(cdp):
+                print("Clicked mailbox settings")
+                clicked_at = time.time()
+            elif click_control(cdp, "#settingsButton", timeout=2, label="mailbox settings"):
+                clicked_at = time.time()
+        time.sleep(0.5)
+    if not mailset_frames(cdp):
+        print(f"Settings page did not open: {page_url(cdp)[:160]}")
+        for frame in child_frames(cdp):
+            print(f"FRAME {str(frame.get('url') or '')[:140]}")
+        raise SystemExit("Could not find mailbox settings")
+    dismiss_mailbox_prompts(cdp, seconds=6)
+    deadline = time.time() + 25
+    opened = False
+    while time.time() < deadline:
+        if click_mailbox_prompt(cdp):
+            time.sleep(0.8)
+            continue
+        if click_mailset_button(cdp, "E-Mail empfangen"):
+            opened = True
+            break
+        time.sleep(0.5)
+    if not opened:
+        raise SystemExit("Could not find E-Mail empfangen")
+    time.sleep(1)
+    dismiss_mailbox_prompts(cdp, seconds=4)
+    if not turn_mailset_pop3_on(cdp):
+        if mailset_pop3_state(cdp):
+            raise SystemExit("Could not turn on POP3/IMAP access")
+        enable_pop3(cdp)
 
 
 def fill_signup(
@@ -2081,10 +3136,25 @@ def fill_signup(
     time.sleep(pause)
     fill_address(cdp, postal_code, city, street, country)
     fill_password(cdp, password)
-    if phone_step is None:
-        verify_phone(cdp, port)
-    else:
-        phone_step(cdp)
+    try:
+        if phone_step is None:
+            verify_phone(cdp, port)
+        else:
+            phone_step(cdp)
+    except SystemExit as exc:
+        message = str(exc)
+        lowered = message.lower()
+        if any(part in lowered for part in ("pop3", "imap", "mailbox settings", "e-mail empfangen")):
+            known = mailbox_address(mailbox)
+            if not known:
+                try:
+                    known = visible_mailbox(cdp, mailbox)
+                except (RuntimeError, TimeoutError, OSError):
+                    known = ""
+            if known:
+                save_account(known, password)
+            raise MailboxSettingsError(known, message) from exc
+        raise
     deadline = time.time() + 10
     final = ""
     while time.time() < deadline:

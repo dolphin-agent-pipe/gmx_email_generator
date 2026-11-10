@@ -13,7 +13,7 @@ HERO_SMS_ORDER_COUNT (default 3, maximum 10) and clicks Buy
 once, so that one click orders every number. The new numbers are the top rows
 on the purchases page that were not listed before the click. They are saved
 under that email in kka_orders.json. get_code opens a new SERVICE_URL2/purchases/numbers
-page, waits up to 2 minutes for an OTP on the matching row, and closes that
+page, waits up to 3 minutes for an OTP on the matching row, and closes that
 page when it returns. code_passed clicks complete activation on the row whose
 code was read, cancels the other rows for that email, and deletes those saved
 numbers.
@@ -41,6 +41,8 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+import live_numbers
 
 ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
@@ -192,15 +194,53 @@ class SmsError(Exception):
     pass
 
 
+def park_broken(path: Path) -> Path | None:
+    backup = path.with_name(f"{path.stem}.broken-{time.time_ns()}{path.suffix}")
+    try:
+        path.replace(backup)
+    except OSError:
+        return None
+    return backup
+
+
+def save_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    temp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    last: Exception | None = None
+    try:
+        for _attempt in range(5):
+            try:
+                temp.replace(path)
+                return
+            except OSError as exc:
+                last = exc
+                time.sleep(0.15)
+        raise OSError(f"Could not save {path.name}") from last
+    finally:
+        try:
+            if temp.exists():
+                temp.unlink()
+        except OSError:
+            pass
+
+
 class OrderStore:
     def __init__(self, path: Path):
         self.path = path
         self.data = {"emails": {}, "phones": {}}
+        self._blocked = False
         if not path.is_file():
             return
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            backup = park_broken(path)
+            if backup is None:
+                self._blocked = True
+                log(f"Could not read {path.name}. New numbers will not be written over it. ({exc})")
+            else:
+                log(f"Could not read {path.name}. Kept it as {backup.name}.")
             return
         if isinstance(loaded, dict):
             emails = loaded.get("emails")
@@ -211,10 +251,10 @@ class OrderStore:
                 self.data["phones"] = phones
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.path.with_suffix(".json.tmp")
-        temp.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
-        temp.replace(self.path)
+        if self._blocked:
+            log(f"Skipped saving {self.path.name} because the current file could not be read")
+            return
+        save_json(self.path, self.data)
 
     def add(self, email: str, kind: str, phone: str, price: str, bought_at: str) -> None:
         key = digits(phone)
@@ -271,6 +311,24 @@ class OrderStore:
                 continue
             removed.append(str((record or {}).get("phone") or key))
             self.data["phones"].pop(key, None)
+        self.save()
+        return removed
+
+    def drop_phones(self, phones: list[str]) -> list[str]:
+        keys = {digits(phone) for phone in phones if digits(phone)}
+        if not keys:
+            return []
+        removed = []
+        for key in keys:
+            record = self.data["phones"].pop(key, None)
+            if isinstance(record, dict):
+                removed.append(str(record.get("phone") or key))
+        for email, entry in list(self.data["emails"].items()):
+            if not isinstance(entry, dict):
+                continue
+            entry["phones"] = [key for key in entry.get("phones") or [] if str(key) not in keys]
+            if not entry["phones"]:
+                self.data["emails"].pop(email, None)
         self.save()
         return removed
 
@@ -1943,8 +2001,75 @@ class NumberService:
             lambda email=email, provider=provider, wanted=wanted, chosen=chosen: self._get_started(email, provider, wanted, chosen),
         )
 
+    def _reuse_or_none(self, email: str, kind: str, count: int) -> dict | None:
+        reused = live_numbers.take("hero", kind, count)
+        if not reused:
+            return None
+        for item in reused["orders"]:
+            remain = int(item.get("remain_seconds") or 0)
+            log(f"Reusing {item.get('phone')} ({max(1, (remain + 59) // 60)} min left)")
+        reused["email"] = email
+        return reused
+
+    def _remember_code(self, number: str, code: str) -> None:
+        if not live_numbers.enabled():
+            return
+        stored = self.store.find_phone(number) or live_numbers.record(number)
+        kind = str(stored.get("type") or "gmx")
+        saved = live_numbers.prove(
+            "hero",
+            kind,
+            number,
+            code=code,
+            ordered_at=str(stored.get("created_at") or stored.get("ordered_at") or ""),
+        )
+        remain = int(saved.get("remain_seconds") or 0)
+        log(f"Keeping {plus_phone(number)} for {max(1, (remain + 59) // 60)} min")
+
+    def _release_expired(self) -> None:
+        gone = live_numbers.expired("hero")
+        if not gone:
+            return
+        log(f"Removing {len(gone)} timed out number(s)")
+        try:
+            self.browser.open_purchases()
+        except (SmsError, RuntimeError, TimeoutError, OSError) as exc:
+            log(f"Could not open purchases for timed out numbers: {exc}")
+        for item in gone:
+            phone = str(item.get("phone") or "")
+            try:
+                action = self.browser.press_row(phone, "check")
+                log(f"Timed out {plus_phone(phone)} {action}")
+            except (SmsError, RuntimeError, TimeoutError, OSError) as exc:
+                log(f"Could not close timed out {plus_phone(phone)}: {exc}")
+            live_numbers.drop(phone)
+            self.store.drop_phones([phone])
+
     def _get_started(self, email: str, kind: str, count: int, tier: int) -> dict:
         self.browser.ensure_session()
+        self._release_expired()
+        previous = [
+            item
+            for item in self.store.phones_for(email)
+            if item.get("status") in {"active", "coded"} and item.get("phone")
+        ]
+        if previous:
+            _kept, closing = live_numbers.partition(previous)
+            if closing:
+                log("Cancelling the previous price order")
+                closed = self._code_passed(email)
+                if not closed.get("ok") and closed.get("error") != "unknown email":
+                    return {
+                        "ok": False,
+                        "error": "Could not cancel the previous price order",
+                        "email": email,
+                        "type": kind,
+                        "phones": [],
+                        "orders": [],
+                    }
+        reused = self._reuse_or_none(email, kind, count)
+        if reused:
+            return reused
         phones: list[str] = []
         orders: list[dict] = []
         known: set[str] = set()
@@ -2018,6 +2143,7 @@ class NumberService:
             target = self.browser.open_code_page()
             deadline = time.monotonic() + OTP_WAIT_SECONDS
             found_row = False
+            warned = False
             while time.monotonic() < deadline:
                 try:
                     row = self.browser.matching_row(number)
@@ -2031,12 +2157,22 @@ class NumberService:
                 code = ""
                 if row and "waiting" not in str(row.get("status") or "").lower():
                     code = parse_otp(str(row.get("otp") or ""))
+                if code and live_numbers.same_as_last(number, code):
+                    if not warned:
+                        log(f"Waiting for a new code on {plus_phone(number)}")
+                        warned = True
+                    code = ""
                 if code:
                     self.store.mark(number, "coded")
+                    self._remember_code(number, code)
                     log(f"OTP for {number} is {code}")
                     return {"ok": True, "phone": plus_phone(number), "code": code}
                 time.sleep(1)
-            log(f"No OTP for {number} within 2 minutes")
+            if live_numbers.is_live(number):
+                live_numbers.pause(number, 45)
+                log(f"No new code for {plus_phone(number)}. It stays saved for the next order.")
+            else:
+                log(f"No OTP for {number} within 3 minutes")
             return {"ok": False, "error": "failed", "phone": plus_phone(number)}
         finally:
             self.browser.close_code_page(target)
@@ -2048,6 +2184,7 @@ class NumberService:
         return self._submit(f"code_passed {email}", lambda email=email: self._code_passed(email))
 
     def _code_passed(self, email: str) -> dict:
+        self._release_expired()
         records = [
             item
             for item in self.store.phones_for(email)
@@ -2055,6 +2192,10 @@ class NumberService:
         ]
         if not records:
             return {"ok": False, "error": "unknown email", "email": email, "results": []}
+        kept, records = live_numbers.partition(records)
+        if not records:
+            log(f"Keeping {len(kept)} live number(s)")
+            return {"ok": True, "email": email, "results": [], "kept": True}
         self.browser.open_purchases()
         return self._finish_numbers(email, records)
 
@@ -2110,13 +2251,14 @@ class NumberService:
         for record in pending:
             results.append({"phone": plus_phone(str(record.get("phone") or "")), "action": "waiting"})
         closed = [item for item in results if item["action"] in {"done", "cancel"}]
-        removed = self.store.remove_email(email)
-        log(f"Removed {len(removed)} number(s) for {email}")
-        payload = {"email": email, "results": results, "removed": removed}
+        payload = {"email": email, "results": results}
         if pending or len(closed) != len(records):
             payload["ok"] = False
             payload["error"] = "waiting"
             return payload
+        removed = self.store.drop_phones([str(record.get("phone") or "") for record in records])
+        log(f"Removed {len(removed)} number(s) for {email}")
+        payload["removed"] = removed
         payload["ok"] = True
         return payload
 

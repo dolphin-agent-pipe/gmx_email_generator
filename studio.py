@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import live_numbers
+
 ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
 STORE_FILE = ROOT / "studio_queue.json"
@@ -76,6 +78,38 @@ order_lock = threading.Lock()
 state: dict = {"rows": [], "history": [], "running": False, "provider": "smscode", "kind": "gmx"}
 worker: threading.Thread | None = None
 inflight = 0
+store_blocked = False
+
+
+def park_broken(path: Path) -> Path | None:
+    backup = path.with_name(f"{path.stem}.broken-{time.time_ns()}{path.suffix}")
+    try:
+        path.replace(backup)
+    except OSError:
+        return None
+    return backup
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    temp.write_text(text, encoding="utf-8")
+    last: Exception | None = None
+    try:
+        for _attempt in range(5):
+            try:
+                temp.replace(path)
+                return
+            except OSError as exc:
+                last = exc
+                time.sleep(0.15)
+        raise OSError(f"Could not save {path.name}") from last
+    finally:
+        try:
+            if temp.exists():
+                temp.unlink()
+        except OSError:
+            pass
 
 
 def now_stamp() -> str:
@@ -83,11 +117,18 @@ def now_stamp() -> str:
 
 
 def load_store() -> None:
+    global store_blocked
     if not STORE_FILE.is_file():
         return
     try:
         loaded = json.loads(STORE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        backup = park_broken(STORE_FILE)
+        if backup is None:
+            store_blocked = True
+            print(f"Could not read the queue file ({exc}). It will not be overwritten.", flush=True)
+        else:
+            print(f"Could not read the queue file ({exc}). Kept it as {backup.name}.", flush=True)
         return
     if not isinstance(loaded, dict):
         return
@@ -97,16 +138,32 @@ def load_store() -> None:
         state["rows"] = [item for item in rows if isinstance(item, dict)]
     if isinstance(history, list):
         state["history"] = [item for item in history if isinstance(item, dict)]
+    changed = False
     for row in state["rows"]:
         if row.get("status") in {"running", "queued"}:
-            row["status"] = "ready"
             row["cancel"] = False
-            row["detail"] = "Interrupted. Start again."
+            if row.get("task") == "pop3":
+                row["status"] = "pop3"
+                row["detail"] = "Interrupted. Enable POP3/IMAP again."
+            else:
+                row["status"] = "ready"
+                row["task"] = ""
+                row["detail"] = "Interrupted. Start again."
+            changed = True
+        elif row.get("status") == "failed" and settings_failure(str(row.get("detail") or "")) and "@" in str(row.get("email") or ""):
+            row["status"] = "pop3"
+            row["task"] = "pop3"
+            changed = True
+    if changed:
+        save_store()
 
 
 def save_store() -> None:
+    if store_blocked:
+        print("Skipped saving the queue because the current file could not be read", flush=True)
+        return
     payload = {"rows": state["rows"], "history": state["history"]}
-    STORE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    write_text_atomic(STORE_FILE, json.dumps(payload, indent=2))
 
 
 def read_store_file() -> tuple[list[dict], list[dict]]:
@@ -259,6 +316,8 @@ def public_state() -> dict:
             "providers": [{"id": key, "label": item["label"]} for key, item in PROVIDERS.items()],
             "rows": list(state["rows"]),
             "history": list(state["history"]),
+            "reuse_numbers": live_numbers.enabled(),
+            "live_count": live_numbers.live_count(),
         }
 
 
@@ -349,6 +408,11 @@ class RowCancelled(Exception):
     pass
 
 
+def settings_failure(message: str) -> bool:
+    lowered = message.lower()
+    return any(part in lowered for part in ("pop3", "imap", "mailbox settings", "e-mail empfangen"))
+
+
 def console(row: dict, detail: str) -> None:
     name = f"{row.get('first', '')} {row.get('last', '')}".strip() or row.get("id", "")
     print(f"[{name}] {detail}", flush=True)
@@ -390,13 +454,21 @@ def call_service(row: dict, base: str, path: str, body: dict | None, timeout: fl
     return box.get("result") or {}
 
 
-def finish_numbers(provider: str, email: str, row: dict) -> None:
+def finish_numbers(provider: str, email: str, row: dict) -> bool:
     try:
-        call_service(row, PROVIDERS[provider]["base"], "/code_passed", {"email": email}, 180)
+        payload = call_service(row, PROVIDERS[provider]["base"], "/code_passed", {"email": email}, 180)
     except RowCancelled:
         raise
     except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
         set_detail_by_email(email, f"Could not close numbers: {exc}")
+        return False
+    if isinstance(payload, dict) and payload.get("ok"):
+        return True
+    if isinstance(payload, dict) and payload.get("error") == "unknown email":
+        return True
+    detail = str(payload.get("error") or "waiting") if isinstance(payload, dict) else "waiting"
+    set_detail(row, f"Previous price order is still open: {detail}")
+    return False
 
 
 def set_detail_by_email(email: str, detail: str) -> None:
@@ -408,7 +480,7 @@ def set_detail_by_email(email: str, detail: str) -> None:
 
 
 def run_row(row: dict, provider: str, kind: str) -> None:
-    from gmx_gen import NoPhonesLeft, SignupRestart, generate_mailbox
+    from gmx_gen import MailboxSettingsError, NoPhonesLeft, SignupRestart, generate_mailbox, mailbox_address
 
     email_key = service_email(row, kind)
     with state_lock:
@@ -423,6 +495,22 @@ def run_row(row: dict, provider: str, kind: str) -> None:
     try:
         price_index = 0
         failed_batches = 0
+
+        def cancel_previous_price() -> bool:
+            nonlocal ordered
+            if not ordered:
+                return True
+            console(row, "Cancelling the previous price order")
+            set_detail(row, "Cancelling the previous price order")
+            closed = False
+            for _attempt in range(2):
+                ensure_active(row)
+                closed = finish_numbers(provider, email_key, row)
+                if closed:
+                    break
+            ordered = False
+            return closed
+
         while True:
             ensure_active(row)
             with order_lock:
@@ -438,11 +526,15 @@ def run_row(row: dict, provider: str, kind: str) -> None:
             if not started.get("ok") or not phones:
                 error = str(started.get("error") or "The number service did not return a phone")
                 lowered = error.lower()
+                if "could not cancel the previous price order" in lowered:
+                    raise RuntimeError("Could not cancel the previous price order")
                 if price_index >= 20 or any(
                     phrase in lowered
                     for phrase in ("no cheaper price", "no germany numbers", "no price with stock", "numbers with stock remain")
                 ):
                     raise RuntimeError("No cheaper phone price is left")
+                if ordered and not cancel_previous_price():
+                    raise RuntimeError("Could not cancel the previous price order")
                 price_index += 1
                 console(row, f"{error} Trying the next price.")
                 continue
@@ -456,7 +548,7 @@ def run_row(row: dict, provider: str, kind: str) -> None:
                     row["detail"] = f"Waiting for SMS on {phone}"
                     save_store()
                 console(row, f"Waiting for SMS on {phone}")
-                payload = call_service(row, PROVIDERS[provider]["base"], "/get_code", {"phone": phone}, 180)
+                payload = call_service(row, PROVIDERS[provider]["base"], "/get_code", {"phone": phone}, 240)
                 return str(payload.get("code") or "") if payload.get("ok") else ""
 
             def log(message: str) -> None:
@@ -512,12 +604,8 @@ def run_row(row: dict, provider: str, kind: str) -> None:
                         raise
                     console(row, f"{message}. Opening the signup again.")
             if restarted:
-                if ordered:
-                    try:
-                        finish_numbers(provider, email_key, row)
-                    except RowCancelled:
-                        raise
-                    ordered = False
+                if ordered and not cancel_previous_price():
+                    raise RuntimeError("Could not cancel the previous price order")
                 failed_batches += 1
                 price_index += 1
                 if failed_batches >= 3:
@@ -560,10 +648,32 @@ def run_row(row: dict, provider: str, kind: str) -> None:
             save_store()
     except (NoPhonesLeft, SystemExit, OSError, urllib.error.URLError, TimeoutError, RuntimeError, ValueError) as exc:
         message = str(getattr(exc, "code", "") or exc).strip() or "Generation failed"
+        email = mailbox_address(str(getattr(exc, "email", "") or ""))
+        known = email or str(row.get("email") or "")
+        pop3_failed = (isinstance(exc, MailboxSettingsError) or settings_failure(message)) and "@" in known
         with state_lock:
-            row["status"] = "failed"
+            row["status"] = "pop3" if pop3_failed else "failed"
+            row["task"] = "pop3" if pop3_failed else ""
             row["detail"] = message[:300]
             row["cancel"] = False
+            if email:
+                row["email"] = email
+                if not row.get("created_at"):
+                    row["created_at"] = now_stamp()
+                if not any(item.get("id") == row.get("id") and item.get("email") == email for item in state["history"]):
+                    state["history"].insert(
+                        0,
+                        {
+                            "id": row["id"],
+                            "created_at": row["created_at"],
+                            "email": email,
+                            "password": row["password"],
+                            "provider": history_provider(row),
+                            "kind": history_kind(row),
+                            "name": person_name(row),
+                            "phone": row.get("phone") or "",
+                        },
+                    )
             save_store()
         console(row, row["detail"])
     except Exception as exc:
@@ -578,8 +688,8 @@ def run_row(row: dict, provider: str, kind: str) -> None:
         if ordered:
             try:
                 finish_numbers(provider, email_key, row)
-            except RowCancelled:
-                pass
+            except Exception:
+                traceback.print_exc()
 
 
 def finish_row_thread() -> None:
@@ -588,9 +698,64 @@ def finish_row_thread() -> None:
         inflight = max(0, inflight - 1)
 
 
+def run_pop3(row: dict) -> None:
+    email = str(row.get("email") or "").strip()
+    password = str(row.get("password") or "")
+    try:
+        if "@" not in email or not password:
+            raise SystemExit("This row has no mailbox to enable")
+
+        def log(message: str) -> None:
+            ensure_active(row)
+            set_detail(row, message)
+
+        from _test_pop3 import enable_existing_mailbox
+
+        enable_existing_mailbox(email, password, log=log, stop=lambda: ensure_active(row))
+        with state_lock:
+            row["status"] = "done"
+            row["task"] = ""
+            row["cancel"] = False
+            row["detail"] = "POP3/IMAP is on"
+            save_store()
+        console(row, f"POP3/IMAP is on for {email}")
+    except RowCancelled:
+        console(row, "Cancelled")
+        with state_lock:
+            row["status"] = "pop3"
+            row["task"] = "pop3"
+            row["cancel"] = False
+            row["detail"] = "Cancelled"
+            save_store()
+    except (SystemExit, OSError, urllib.error.URLError, TimeoutError, RuntimeError, ValueError) as exc:
+        message = str(getattr(exc, "code", "") or exc).strip() or "Could not turn on POP3/IMAP"
+        if password:
+            message = message.replace(password, "***")
+        with state_lock:
+            row["status"] = "pop3"
+            row["task"] = "pop3"
+            row["cancel"] = False
+            row["detail"] = message[:300]
+            save_store()
+        console(row, row["detail"])
+    except Exception as exc:
+        traceback.print_exc()
+        message = str(exc).replace(password, "***") if password else str(exc)
+        with state_lock:
+            row["status"] = "pop3"
+            row["task"] = "pop3"
+            row["cancel"] = False
+            row["detail"] = message[:300] or "Could not turn on POP3/IMAP"
+            save_store()
+        console(row, row["detail"])
+
+
 def run_row_thread(row: dict) -> None:
     try:
-        run_row(row, str(row.get("provider") or ""), str(row.get("kind") or "gmx"))
+        if row.get("task") == "pop3":
+            run_pop3(row)
+        else:
+            run_row(row, str(row.get("provider") or ""), str(row.get("kind") or "gmx"))
     except Exception:
         traceback.print_exc()
     finally:
@@ -599,8 +764,10 @@ def run_row_thread(row: dict) -> None:
 
 def worker_loop() -> None:
     global inflight
-    try:
-        while True:
+    while True:
+        row = None
+        started = False
+        try:
             with state_lock:
                 row = next((item for item in state["rows"] if item.get("status") == "queued"), None)
                 if row is None:
@@ -609,7 +776,7 @@ def worker_loop() -> None:
                         save_store()
                         return
                 elif row.get("cancel"):
-                    row["status"] = "ready"
+                    row["status"] = "pop3" if row.get("task") == "pop3" else "ready"
                     row["cancel"] = False
                     row["detail"] = "Cancelled"
                     save_store()
@@ -623,11 +790,22 @@ def worker_loop() -> None:
                 time.sleep(0.2)
                 continue
             threading.Thread(target=run_row_thread, args=(row,), name=f"studio-row-{row.get('id')}", daemon=True).start()
-    except Exception:
-        traceback.print_exc()
-        with state_lock:
-            state["running"] = False
-            save_store()
+            started = True
+        except Exception:
+            traceback.print_exc()
+            if row is not None and not started:
+                with state_lock:
+                    if row.get("status") == "running":
+                        if row.get("task") == "pop3":
+                            row["status"] = "pop3"
+                            row["detail"] = "Could not start POP3/IMAP. Enable it again."
+                        else:
+                            row["status"] = "ready"
+                            row["task"] = ""
+                            row["detail"] = "Could not start this row. Start it again."
+                        inflight = max(0, inflight - 1)
+                        save_store()
+            time.sleep(0.5)
 
 
 def ensure_worker() -> None:
@@ -656,6 +834,7 @@ def start_rows(provider: str, kind: str, ids: list[str]) -> dict:
             if row.get("id") not in wanted or row.get("status") not in {"ready", "failed"}:
                 continue
             row["status"] = "queued"
+            row["task"] = ""
             row["cancel"] = False
             row["provider"] = provider
             row["kind"] = kind
@@ -668,6 +847,27 @@ def start_rows(provider: str, kind: str, ids: list[str]) -> dict:
         state["provider"] = provider
         state["kind"] = kind
         save_store()
+        ensure_worker()
+    return public_state()
+
+
+def enable_pop3(row_id: str) -> dict:
+    with state_lock:
+        row = next((item for item in state["rows"] if item.get("id") == row_id), None)
+        if row is None:
+            raise ValueError("Row not found")
+        if row.get("status") != "pop3":
+            raise RuntimeError("POP3/IMAP can be enabled after that step fails")
+        email = str(row.get("email") or "")
+        if "@" not in email or not row.get("password"):
+            raise RuntimeError("This row has no mailbox to enable")
+        row["status"] = "queued"
+        row["task"] = "pop3"
+        row["cancel"] = False
+        row["detail"] = "Waiting to enable POP3/IMAP"
+        state["running"] = True
+        save_store()
+        console(row, "Queued POP3/IMAP")
         ensure_worker()
     return public_state()
 
@@ -779,6 +979,8 @@ PAGE = r"""<!DOCTYPE html>
   select:disabled, input:disabled { color: var(--faint); }
   .stats { display: flex; gap: 14px; min-height: 16px; color: var(--muted); font-size: 12px; }
   .stats b { color: var(--ink); font-weight: 600; }
+  .reuse { gap: 7px; }
+  .reuse input { width: 15px; height: 15px; margin: 0; accent-color: #6ea8fe; }
   .spacer { flex: 1; }
   .actions { display: flex; gap: 8px; }
   .btn {
@@ -828,7 +1030,7 @@ PAGE = r"""<!DOCTYPE html>
   .mono { font-family: Consolas, ui-monospace, monospace; font-size: 12px; color: #d5dbe6; }
   .detail { color: var(--muted); font-size: 12px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
   .blank { color: var(--faint); }
-  .status { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); text-transform: capitalize; }
+  .status { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); }
   .status i { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); }
   .status.running { color: #b9ccff; }
   .status.running i { background: #6ea8ff; }
@@ -836,6 +1038,8 @@ PAGE = r"""<!DOCTYPE html>
   .status.done i { background: #3dce8c; }
   .status.failed { color: #f3b0b4; }
   .status.failed i { background: #f07178; }
+  .status.pop3 { color: #f3ddb0; }
+  .status.pop3 i { background: #e2b15a; }
   .status.queued { color: #b9ccff; }
   .status.queued i { background: #6ea8ff; }
   th.check, td.check { width: 42px; text-align: center; padding-left: 12px; padding-right: 8px; }
@@ -843,6 +1047,8 @@ PAGE = r"""<!DOCTYPE html>
   .row-btn { height: 28px; padding: 0 10px; }
   .row-btn.cancel { background: transparent; border-color: #6a3b3b; color: #f3b0b4; }
   .row-btn.cancel:hover { background: #2a1c1e; }
+  .row-btn.enable { background: #2c2618; border-color: #8a6a32; color: #f3ddb0; }
+  .row-btn.enable:hover { background: #3c3422; }
   .empty {
     flex: 1;
     display: grid;
@@ -883,6 +1089,10 @@ PAGE = r"""<!DOCTYPE html>
             <option value="gmx">GMX</option>
             <option value="webde">WEB.DE</option>
           </select>
+        </label>
+        <label class="reuse" title="After a code arrives, keep the number and use it again until it expires">
+          <input id="reuse" type="checkbox">
+          Reuse phone number
         </label>
       </div>
       <div class="stats" id="summary"></div>
@@ -935,6 +1145,7 @@ PAGE = r"""<!DOCTYPE html>
 <script>
 const provider = document.querySelector("#provider");
 const kind = document.querySelector("#kind");
+const reuse = document.querySelector("#reuse");
 const queueBody = document.querySelector("#queue");
 const historyBody = document.querySelector("#history-body");
 let latest = {rows: [], history: [], running: false};
@@ -945,9 +1156,19 @@ function esc(value) {
   return String(value ?? "").replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
 }
 
+const STATUS_LABEL = {
+  ready: "Ready",
+  queued: "Queued",
+  running: "Running",
+  done: "Done",
+  failed: "Signup failed",
+  pop3: "POP3 failed",
+};
+
 function pill(status) {
-  const label = status || "ready";
-  return `<span class="status ${esc(label)}"><i></i>${esc(label)}</span>`;
+  const key = status || "ready";
+  const label = STATUS_LABEL[key] || key;
+  return `<span class="status ${esc(key)}"><i></i>${esc(label)}</span>`;
 }
 
 function textCell(value, cls) {
@@ -963,6 +1184,9 @@ function canStart(row) {
 function rowAction(row) {
   if (row.status === "queued" || row.status === "running") {
     return `<button type="button" class="btn row-btn cancel" data-act="cancel" data-id="${esc(row.id)}">Cancel</button>`;
+  }
+  if (row.status === "pop3") {
+    return `<button type="button" class="btn row-btn enable" data-act="enable" data-id="${esc(row.id)}">Enable POP3/IMAP</button>`;
   }
   if (row.status === "done") return "";
   return `<button type="button" class="btn row-btn" data-act="start" data-id="${esc(row.id)}">Start</button>`;
@@ -991,10 +1215,11 @@ function renderQueue() {
   document.querySelector("#queue-empty").classList.toggle("hidden", rows.length > 0);
   document.querySelector("#queue-wrap").classList.toggle("hidden", rows.length === 0);
   const counts = rows.reduce((sum, row) => { sum[row.status] = (sum[row.status] || 0) + 1; return sum; }, {});
-  document.querySelector("#summary").innerHTML = ["ready", "queued", "running", "done", "failed"]
+  const bits = ["ready", "queued", "running", "done", "failed", "pop3"]
     .filter((key) => counts[key])
-    .map((key) => `<span><b>${counts[key]}</b> ${esc(key)}</span>`)
-    .join("");
+    .map((key) => `<span><b>${counts[key]}</b> ${esc(STATUS_LABEL[key] || key)}</span>`);
+  if (latest.reuse_numbers) bits.push(`<span><b>${Number(latest.live_count) || 0}</b> live</span>`);
+  document.querySelector("#summary").innerHTML = bits.join("");
   const startable = rows.filter((row) => canStart(row) && selected.has(row.id));
   document.querySelector("#start-selected").disabled = startable.length === 0;
   const pickable = rows.filter(canStart);
@@ -1039,6 +1264,7 @@ function applyState(payload) {
     if (latest.provider) provider.value = latest.provider;
     if (latest.kind) kind.value = latest.kind;
   }
+  if (document.activeElement !== reuse) reuse.checked = !!latest.reuse_numbers;
   renderQueue();
   renderHistory();
 }
@@ -1079,6 +1305,7 @@ async function act(path, body) {
   }
 }
 document.querySelector("#import-file").onclick = () => document.querySelector("#file").click();
+reuse.onchange = () => act("/api/reuse", {enabled: reuse.checked});
 document.querySelector("#file").onchange = async (event) => {
   const file = event.target.files && event.target.files[0];
   event.target.value = "";
@@ -1123,6 +1350,10 @@ queueBody.addEventListener("click", (event) => {
   if (!button) return;
   if (button.dataset.act === "start") {
     act("/api/start", {provider: provider.value, kind: kind.value, ids: [button.dataset.id]});
+    return;
+  }
+  if (button.dataset.act === "enable") {
+    act("/api/enable", {id: button.dataset.id});
     return;
   }
   if (button.dataset.act === "cancel") act("/api/cancel", {id: button.dataset.id});
@@ -1175,6 +1406,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("ids must be a list")
                 self._send(start_rows(str(body.get("provider") or ""), str(body.get("kind") or "gmx"), [str(item) for item in raw_ids]), 200)
                 return
+            if path == "/api/enable":
+                self._send(enable_pop3(str(body.get("id") or "")), 200)
+                return
             if path == "/api/cancel":
                 self._send(cancel_row(str(body.get("id") or "")), 200)
                 return
@@ -1188,6 +1422,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/reload":
                 reload_store()
+                self._send(public_state(), 200)
+                return
+            if path == "/api/reuse":
+                enabled = body.get("enabled")
+                if not isinstance(enabled, bool):
+                    raise ValueError("enabled must be true or false")
+                live_numbers.set_enabled(enabled)
+                print(f"Reuse phone number {'on' if enabled else 'off'}", flush=True)
                 self._send(public_state(), 200)
                 return
             self._send({"ok": False, "error": "not found"}, 404)

@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+.venv/
+logs/
 dolphin/apikey.py
 proxies.txt
 freenumber_usage.json
@@ -13,7 +15,6 @@ kka_orders.json.tmp
 kka_browser/
 anosim_orders.json
 anosim_orders.json.tmp
+live_numbers.json
 anosim_browser/
 studio_queue.json
-.venv/
-logs/
