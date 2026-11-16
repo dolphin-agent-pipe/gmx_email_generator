@@ -91,15 +91,15 @@ That opens the Mailbox window at `http://127.0.0.1:8790`. A second copy exits if
 Import a text file, one person per line. `sample_import.txt` is a template. A header line is ignored. Country is optional and defaults to `DE`.
 
 ```
-first;last;day;month;year;plz;city;street;password
-first;last;day;month;year;plz;city;street;password;country
+email;first;last;day;month;year;plz;city;street;password
+email;first;last;day;month;year;plz;city;street;password;country
 ```
 
 ```
-Lena;Hoffmann;12;3;1991;80331;Muenchen;Sendlinger Str. 8;Rote Welle 27?Haus
+lena.hoffmann91@gmx.net;Lena;Hoffmann;12;3;1991;80331;Muenchen;Sendlinger Str. 8;RoteWelle27?Haus
 ```
 
-Limits: names 1–40 characters, street 1–49, postal code 1–10, password 1–100. The birth date must be 18 or older. GMX and WEB.DE expect a password of at least 12 characters with letters, numbers, and symbols.
+The email must be a GMX or WEB.DE address and must match the mailbox type you start (`@gmx.*` for GMX, `@web.de` for WEB.DE). Limits: names 1–40 characters, street 1–49, postal code 1–10, password 1–100. The birth date must be 18 or older. GMX and WEB.DE expect a password of at least 12 characters with letters, numbers, and symbols.
 
 In the window:
 
@@ -115,7 +115,7 @@ In the window:
 
 While a row runs it orders three numbers, opens a Dolphin profile, and walks the signup form. If GMX or WEB.DE rejects a number, or no SMS arrives, the next number is tried. When all three fail, the open order is closed and the next cheaper price is ordered. After three failed batches the row is marked failed.
 
-A finished mailbox is written to `accounts.json` and to History. The address is the one shown on the signup page, which may differ from `first.last`. The Dolphin profile is then closed and deleted.
+A finished mailbox is written to `accounts.json` and to History. Signup uses the imported email address. If that alias is taken, a short random suffix is added. The Dolphin profile is then closed and deleted.
 
 If the mailbox is created but POP3/IMAP does not turn on, the row stays on **POP3 failed** and shows **Enable POP3/IMAP**. That signs in again and retries the setting. You can also do that for a saved mailbox:
 
@@ -133,13 +133,14 @@ Rows that were running or queued when the window closed come back as ready, with
 This path does not use the three number services. It logs into Anosim and picks a German free number.
 
 ```powershell
-python gmx_gen.py lena-hoffmann --first-name Lena --last-name Hoffmann --day 12 --month 3 --year 1991 --plz 80331 --city Muenchen --street "Sendlinger Str. 8" --country DE --password "Rote Welle 27?Haus"
+python gmx_gen.py lena-hoffmann --mailbox lena.hoffmann91@gmx.net --first-name Lena --last-name Hoffmann --day 12 --month 3 --year 1991 --plz 80331 --city Muenchen --street "Sendlinger Str. 8" --country DE --password "RoteWelle27?Haus"
 ```
 
 The first argument is the Dolphin profile name. It does not have to be an email address. Omitted fields are prompted on the keyboard.
 
 | Option | Meaning |
 | --- | --- |
+| `--mailbox` | Desired GMX or WEB.DE address |
 | `--first-name`, `--last-name` | 1–40 characters |
 | `--day`, `--month`, `--year` | Birth date, age 18 or older |
 | `--plz` | Postal code, 1–10 characters |

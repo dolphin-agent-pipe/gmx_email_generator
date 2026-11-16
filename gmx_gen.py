@@ -1145,6 +1145,18 @@ def tweak_email(value: str) -> str:
     return local + (separator + domain if separator else "")
 
 
+def email_local_part(value: str) -> str:
+    local = str(value or "").split("@", 1)[0].strip()
+    return re.sub(r"[^A-Za-z0-9._-]", "", local)
+
+
+def email_domain_part(value: str) -> str:
+    text = str(value or "").strip()
+    if "@" not in text:
+        return ""
+    return text.split("@", 1)[1].strip().lower().lstrip("@")
+
+
 def mailbox_address(value: str) -> str:
     match = re.search(
         r"[A-Za-z0-9._%+-]+@(?:web\.de|gmx\.net|gmx\.de|gmx\.com|gmx\.at|gmx\.ch)\b",
@@ -1152,6 +1164,30 @@ def mailbox_address(value: str) -> str:
         re.IGNORECASE,
     )
     return match.group(0) if match else ""
+
+
+def select_email_domain(cdp: Cdp, domain: str) -> str:
+    wanted = email_domain_part(domain)
+    if not wanted:
+        return ""
+    selected = evaluate(
+        cdp,
+        "(() => {"
+        f" const wanted = {json.dumps(wanted)};"
+        " const selects = [...document.querySelectorAll('select')];"
+        " for (const sel of selects) {"
+        "  const options = [...(sel.options || [])];"
+        "  const match = options.find((opt) => String(opt.value || opt.text || '').replace(/^@/, '').trim().toLowerCase() === wanted);"
+        "  if (!match) continue;"
+        "  sel.value = match.value;"
+        "  sel.dispatchEvent(new Event('input', {bubbles: true}));"
+        "  sel.dispatchEvent(new Event('change', {bubbles: true}));"
+        "  return String(match.value || match.text || '').replace(/^@/, '').trim();"
+        " }"
+        " return '';"
+        "})()",
+    )
+    return str(selected or "")
 
 
 def visible_mailbox(cdp: Cdp, fallback: str) -> str:
@@ -1287,47 +1323,81 @@ def chosen_mailbox(cdp: Cdp, fallback: str) -> str:
     return found
 
 
-def choose_email(cdp: Cdp, fallback_email: str) -> str:
-    deadline = time.time() + 25
+def choose_email(cdp: Cdp, desired_email: str) -> str:
+    wanted = mailbox_address(desired_email) or str(desired_email or "").strip()
+    local = email_local_part(wanted)
+    domain = email_domain_part(wanted)
+    if not local:
+        raise SystemExit("Missing email address")
+    fallback = wanted if "@" in wanted else (f"{local}@{domain}" if domain else local)
+    current = local
+    typed = False
+    deadline = time.time() + 30
     attempts = 0
     while time.time() < deadline:
         selector = email_selector(cdp)
         alias_open = bool(selector) and on_screen(cdp, selector)
         if not alias_open and on_screen(cdp, "#postalCode"):
             print("Address form is already open")
-            return chosen_mailbox(cdp, fallback_email)
+            return chosen_mailbox(cdp, fallback)
+        if alias_open and not typed:
+            try:
+                type_into(cdp, selector, current)
+            except SystemExit:
+                time.sleep(1)
+                selector = email_selector(cdp)
+                if not (selector and on_screen(cdp, selector)) and on_screen(cdp, "#postalCode"):
+                    print("Address form is already open")
+                    return chosen_mailbox(cdp, fallback)
+                raise
+            if domain:
+                selected = select_email_domain(cdp, domain)
+                if selected:
+                    print(f"Email domain set to @{selected}")
+            print(f"Email set to {current}" + (f"@{domain}" if domain else ""))
+            typed = True
+            time.sleep(1.5)
+            continue
         state = weiter_state(cdp)
-        if state.get("found") and not state.get("disabled") and not state.get("taken"):
-            return confirm_visible_email(cdp, fallback_email)
-        needs_change = bool(selector) and (state.get("taken") or (state.get("found") and state.get("disabled")))
+        if typed and state.get("found") and not state.get("disabled") and not state.get("taken"):
+            return confirm_visible_email(cdp, fallback)
+        needs_change = typed and bool(selector) and (
+            state.get("taken") or (state.get("found") and state.get("disabled"))
+        )
         if needs_change and not state.get("taken"):
             time.sleep(3)
             selector = email_selector(cdp)
             alias_open = bool(selector) and on_screen(cdp, selector)
             if not alias_open and on_screen(cdp, "#postalCode"):
                 print("Address form is already open")
-                return chosen_mailbox(cdp, fallback_email)
+                return chosen_mailbox(cdp, fallback)
             state = weiter_state(cdp)
             if state.get("found") and not state.get("disabled") and not state.get("taken"):
-                return confirm_visible_email(cdp, fallback_email)
-            needs_change = bool(email_selector(cdp)) and (state.get("taken") or (state.get("found") and state.get("disabled")))
+                return confirm_visible_email(cdp, fallback)
+            needs_change = bool(email_selector(cdp)) and (
+                state.get("taken") or (state.get("found") and state.get("disabled"))
+            )
             selector = email_selector(cdp)
         if needs_change:
             if attempts >= 8:
                 raise SystemExit("Weiter stayed disabled after changing the email")
             attempts += 1
-            current = field_value(cdp, selector).strip() or fallback_email.split("@", 1)[0]
-            updated = tweak_email(current)
+            base = field_value(cdp, selector).strip() or current
+            updated = tweak_email(base if "@" not in base else base.split("@", 1)[0])
+            current = email_local_part(updated)
+            fallback = f"{current}@{domain}" if domain else current
             try:
-                type_into(cdp, selector, updated)
+                type_into(cdp, selector, current)
             except SystemExit:
                 time.sleep(1)
                 selector = email_selector(cdp)
                 if not (selector and on_screen(cdp, selector)) and on_screen(cdp, "#postalCode"):
                     print("Address form is already open")
-                    return chosen_mailbox(cdp, updated if "@" in updated else fallback_email)
+                    return chosen_mailbox(cdp, fallback)
                 raise
-            print(f"Email updated to {updated}")
+            if domain:
+                select_email_domain(cdp, domain)
+            print(f"Email updated to {current}" + (f"@{domain}" if domain else ""))
             time.sleep(1.5)
             continue
         time.sleep(0.4)
@@ -3256,6 +3326,7 @@ def generate_mailbox(
     proxy_type: str = "http",
     headless: bool = False,
     skip_check: bool = True,
+    desired_email: str = "",
 ) -> tuple[str, str]:
     profile = normalize_profile_name(profile)
     first_name = normalize_name(first_name, "First name")
@@ -3265,6 +3336,9 @@ def generate_mailbox(
     city = normalize_name(city, "Ort")
     street = " ".join(street.split())
     country = country.strip().upper() or "DE"
+    wanted_email = mailbox_address(desired_email) or str(desired_email or "").strip()
+    if not wanted_email:
+        raise SystemExit("Missing email address")
     if not url:
         raise SystemExit(f"Set TARGET_URL1 in {ENV_FILE}")
     if not street or len(street) > 49:
@@ -3310,7 +3384,7 @@ def generate_mailbox(
         open_registration(cdp)
         mailbox = fill_signup(
             cdp,
-            profile,
+            wanted_email,
             first_name,
             last_name,
             day,
@@ -3379,6 +3453,7 @@ def main() -> None:
         description="Create a Dolphin profile, open TARGET_URL1, and submit the signup form."
     )
     parser.add_argument("email", nargs="?", help="Name for the Dolphin profile")
+    parser.add_argument("--mailbox", help="Desired mailbox address, for example lena.hoffmann@gmx.net")
     parser.add_argument("--first-name", help="First name for the signup form")
     parser.add_argument("--last-name", help="Last name for the signup form")
     parser.add_argument("--day", help="Birth day")
@@ -3404,7 +3479,10 @@ def main() -> None:
             args.email = input("Dolphin profile name: ")
         if not args.email:
             raise SystemExit("Pass the profile name: python gmx_gen.py lena-hoffmann")
-    email = normalize_profile_name(args.email)
+    profile = normalize_profile_name(args.email)
+    desired_mailbox = mailbox_address(ask(args.mailbox, "Mailbox address"))
+    if not desired_mailbox:
+        raise SystemExit("Mailbox must be a GMX or WEB.DE address")
     first_name = normalize_name(ask(args.first_name, "First name"), "First name")
     last_name = normalize_name(ask(args.last_name, "Last name"), "Last name")
     day, month, year = normalize_birth(
@@ -3440,14 +3518,14 @@ def main() -> None:
     print(f"Using {proxy_label(proxy, proxy_type)}")
 
     api = DolphinAPI(collect_garbage_on_init=False)
-    profile_id = create_profile(api, email, proxy, proxy_type)
+    profile_id = create_profile(api, profile, proxy, proxy_type)
     ws: CdpSocket | None = None
     cdp: Cdp | None = None
-    mailbox = email
+    mailbox = desired_mailbox
     try:
         automation = start_profile(session, profile_id, args.headless)
         port = int(automation["port"])
-        print(f"Started {email} on port {port}")
+        print(f"Started {profile} on port {port}")
         ws, target_id = connect_page(port)
         cdp = Cdp(ws)
         if target_id:
@@ -3462,7 +3540,7 @@ def main() -> None:
         open_registration(cdp)
         mailbox = fill_signup(
             cdp,
-            email,
+            desired_mailbox,
             first_name,
             last_name,
             day,

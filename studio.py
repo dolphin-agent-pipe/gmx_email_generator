@@ -11,8 +11,8 @@ is used for a batch.
 
 Each imported line is split on semicolons:
 
-    first;last;day;month;year;plz;city;street;password
-    first;last;day;month;year;plz;city;street;password;country
+    email;first;last;day;month;year;plz;city;street;password
+    email;first;last;day;month;year;plz;city;street;password;country
 """
 
 from __future__ import annotations
@@ -71,7 +71,11 @@ PROVIDERS = {
         "base": f"http://127.0.0.1:{os.environ.get('ANOSIM_PORT', '8782')}",
     },
 }
-COLUMNS = ("first", "last", "day", "month", "year", "plz", "city", "street", "password")
+COLUMNS = ("email", "first", "last", "day", "month", "year", "plz", "city", "street", "password")
+EMAIL_RE = re.compile(
+    r"^[A-Za-z0-9._%+-]+@(?:web\.de|gmx\.net|gmx\.de|gmx\.com|gmx\.at|gmx\.ch)$",
+    re.IGNORECASE,
+)
 
 state_lock = threading.Lock()
 order_lock = threading.Lock()
@@ -196,7 +200,7 @@ def account_records() -> list[dict]:
     return [item for item in raw if isinstance(item, dict) and str(item.get("email") or "").strip()]
 
 
-PROFILE_FIELDS = ("first", "last", "day", "month", "year", "plz", "city", "street", "password", "country")
+PROFILE_FIELDS = ("email", "first", "last", "day", "month", "year", "plz", "city", "street", "password", "country")
 
 
 def person_name(row: dict) -> str:
@@ -328,21 +332,22 @@ def parse_rows(text: str) -> list[dict]:
         if not raw or raw.startswith("#"):
             continue
         parts = [part.strip() for part in raw.split(";")]
-        if parts and parts[0].lower() == "first":
+        if parts and parts[0].lower() in {"email", "first"}:
             continue
         row = {key: "" for key in COLUMNS}
         row["country"] = "DE"
         for key, value in zip(COLUMNS, parts):
             row[key] = value
-        if len(parts) >= 10 and parts[9]:
-            row["country"] = parts[9].upper()
+        if len(parts) >= 11 and parts[10]:
+            row["country"] = parts[10].upper()
+        email = str(row.get("email") or "").strip()
         row.update(
             {
                 "id": uuid.uuid4().hex[:12],
                 "status": "ready",
                 "detail": "",
                 "phone": "",
-                "email": "",
+                "email": email,
                 "created_at": "",
                 "provider": "",
                 "kind": "",
@@ -352,6 +357,9 @@ def parse_rows(text: str) -> list[dict]:
         if missing:
             row["status"] = "failed"
             row["detail"] = "Missing " + ", ".join(missing)
+        elif not EMAIL_RE.match(email):
+            row["status"] = "failed"
+            row["detail"] = "Email must be a GMX or WEB.DE address"
         rows.append(row)
     return rows
 
@@ -397,7 +405,19 @@ def phone_values(payload: dict) -> list[str]:
     return [phone for phone in found if phone]
 
 
+def email_matches_kind(email: str, kind: str) -> bool:
+    addr = str(email or "").strip().lower()
+    if kind == "webde":
+        return addr.endswith("@web.de")
+    if kind == "gmx":
+        return bool(re.search(r"@gmx\.(net|de|com|at|ch)$", addr))
+    return False
+
+
 def service_email(row: dict, kind: str) -> str:
+    wanted = str(row.get("email") or "").strip()
+    if EMAIL_RE.match(wanted):
+        return wanted
     local = re.sub(r"[^a-z0-9]+", ".", f"{row['first']}.{row['last']}".lower()).strip(".")
     local = local[:40] or row["id"]
     domain = "web.de" if kind == "webde" else "gmx.net"
@@ -481,6 +501,23 @@ def set_detail_by_email(email: str, detail: str) -> None:
 
 def run_row(row: dict, provider: str, kind: str) -> None:
     from gmx_gen import MailboxSettingsError, NoPhonesLeft, SignupRestart, generate_mailbox, mailbox_address
+
+    desired = str(row.get("email") or "").strip()
+    if not EMAIL_RE.match(desired):
+        with state_lock:
+            row["status"] = "failed"
+            row["detail"] = "Email must be a GMX or WEB.DE address"
+            save_store()
+        console(row, row["detail"])
+        return
+    if not email_matches_kind(desired, kind):
+        label = "WEB.DE" if kind == "webde" else "GMX"
+        with state_lock:
+            row["status"] = "failed"
+            row["detail"] = f"Email domain does not match {label}"
+            save_store()
+        console(row, row["detail"])
+        return
 
     email_key = service_email(row, kind)
     with state_lock:
@@ -583,6 +620,7 @@ def run_row(row: dict, provider: str, kind: str) -> None:
                         fetch_code,
                         log=log,
                         stop=stop,
+                        desired_email=desired,
                     )
                     break
                 except SignupRestart:
@@ -1107,7 +1145,7 @@ PAGE = r"""<!DOCTYPE html>
     <div class="empty" id="queue-empty">
       <div>
         <strong>Nothing imported</strong>
-        <span>One person per line · <code>first;last;day;month;year;plz;city;street;password</code></span>
+        <span>One person per line · <code>email;first;last;day;month;year;plz;city;street;password</code></span>
       </div>
     </div>
     <div class="table-wrap hidden" id="queue-wrap">
