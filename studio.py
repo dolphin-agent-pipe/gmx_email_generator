@@ -13,6 +13,9 @@ Each imported line is split on semicolons:
 
     email;first;last;day;month;year;plz;city;street;password
     email;first;last;day;month;year;plz;city;street;password;country
+
+The email domain chooses GMX or WEB.DE. If that address is taken,
+signup uses the provider suggestion and marks the row as suggested.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import threading
 import time
 import traceback
@@ -200,7 +204,21 @@ def account_records() -> list[dict]:
     return [item for item in raw if isinstance(item, dict) and str(item.get("email") or "").strip()]
 
 
-PROFILE_FIELDS = ("email", "first", "last", "day", "month", "year", "plz", "city", "street", "password", "country")
+PROFILE_FIELDS = (
+    "email",
+    "requested_email",
+    "suggested",
+    "first",
+    "last",
+    "day",
+    "month",
+    "year",
+    "plz",
+    "city",
+    "street",
+    "password",
+    "country",
+)
 
 
 def person_name(row: dict) -> str:
@@ -341,6 +359,7 @@ def parse_rows(text: str) -> list[dict]:
         if len(parts) >= 11 and parts[10]:
             row["country"] = parts[10].upper()
         email = str(row.get("email") or "").strip()
+        kind = kind_from_email(email)
         row.update(
             {
                 "id": uuid.uuid4().hex[:12],
@@ -348,16 +367,18 @@ def parse_rows(text: str) -> list[dict]:
                 "detail": "",
                 "phone": "",
                 "email": email,
+                "requested_email": email,
+                "suggested": False,
                 "created_at": "",
                 "provider": "",
-                "kind": "",
+                "kind": kind,
             }
         )
         missing = [key for key in COLUMNS if not row[key]]
         if missing:
             row["status"] = "failed"
             row["detail"] = "Missing " + ", ".join(missing)
-        elif not EMAIL_RE.match(email):
+        elif not EMAIL_RE.match(email) or not kind:
             row["status"] = "failed"
             row["detail"] = "Email must be a GMX or WEB.DE address"
         rows.append(row)
@@ -405,13 +426,13 @@ def phone_values(payload: dict) -> list[str]:
     return [phone for phone in found if phone]
 
 
-def email_matches_kind(email: str, kind: str) -> bool:
+def kind_from_email(email: str) -> str:
     addr = str(email or "").strip().lower()
-    if kind == "webde":
-        return addr.endswith("@web.de")
-    if kind == "gmx":
-        return bool(re.search(r"@gmx\.(net|de|com|at|ch)$", addr))
-    return False
+    if addr.endswith("@web.de"):
+        return "webde"
+    if re.search(r"@gmx\.(net|de|com|at|ch)$", addr):
+        return "gmx"
+    return ""
 
 
 def service_email(row: dict, kind: str) -> str:
@@ -502,19 +523,12 @@ def set_detail_by_email(email: str, detail: str) -> None:
 def run_row(row: dict, provider: str, kind: str) -> None:
     from gmx_gen import MailboxSettingsError, NoPhonesLeft, SignupRestart, generate_mailbox, mailbox_address
 
-    desired = str(row.get("email") or "").strip()
-    if not EMAIL_RE.match(desired):
+    desired = str(row.get("requested_email") or row.get("email") or "").strip()
+    kind = kind_from_email(desired) or str(kind or "").strip()
+    if not EMAIL_RE.match(desired) or kind not in {"gmx", "webde"}:
         with state_lock:
             row["status"] = "failed"
             row["detail"] = "Email must be a GMX or WEB.DE address"
-            save_store()
-        console(row, row["detail"])
-        return
-    if not email_matches_kind(desired, kind):
-        label = "WEB.DE" if kind == "webde" else "GMX"
-        with state_lock:
-            row["status"] = "failed"
-            row["detail"] = f"Email domain does not match {label}"
             save_store()
         console(row, row["detail"])
         return
@@ -524,27 +538,31 @@ def run_row(row: dict, provider: str, kind: str) -> None:
         row["status"] = "running"
         row["provider"] = provider
         row["kind"] = kind
+        row["requested_email"] = desired
+        row["suggested"] = False
         row["service_email"] = email_key
         row["detail"] = "Ordering numbers"
         save_store()
-    console(row, "Ordering numbers")
+    console(row, f"Ordering numbers for {'WEB.DE' if kind == 'webde' else 'GMX'}")
     ordered = False
     try:
         price_index = 0
         failed_batches = 0
+        suggested = False
 
-        def cancel_previous_price() -> bool:
+        def cancel_previous_price(force: bool = False) -> bool:
             nonlocal ordered
-            if not ordered:
+            if not ordered and not force:
                 return True
             console(row, "Cancelling the previous price order")
             set_detail(row, "Cancelling the previous price order")
             closed = False
-            for _attempt in range(2):
+            for _attempt in range(4):
                 ensure_active(row)
                 closed = finish_numbers(provider, email_key, row)
                 if closed:
                     break
+                time.sleep(1.5)
             ordered = False
             return closed
 
@@ -564,7 +582,10 @@ def run_row(row: dict, provider: str, kind: str) -> None:
                 error = str(started.get("error") or "The number service did not return a phone")
                 lowered = error.lower()
                 if "could not cancel the previous price order" in lowered:
-                    raise RuntimeError("Could not cancel the previous price order")
+                    if not cancel_previous_price(force=True):
+                        raise RuntimeError("Could not cancel the previous price order")
+                    console(row, "Previous price order cleared. Ordering again.")
+                    continue
                 if price_index >= 20 or any(
                     phrase in lowered
                     for phrase in ("no cheaper price", "no germany numbers", "no price with stock", "numbers with stock remain")
@@ -603,7 +624,7 @@ def run_row(row: dict, provider: str, kind: str) -> None:
             for browser_try in range(3):
                 ensure_active(row)
                 try:
-                    mailbox, used = generate_mailbox(
+                    mailbox, used, suggested = generate_mailbox(
                         profile,
                         row["first"],
                         row["last"],
@@ -638,7 +659,7 @@ def run_row(row: dict, provider: str, kind: str) -> None:
                             "zustimmen",
                         )
                     )
-                    if browser_try == 2 or "phone" in lowered or finished:
+                    if browser_try == 4 or "phone" in lowered or finished:
                         raise
                     console(row, f"{message}. Opening the signup again.")
             if restarted:
@@ -659,9 +680,11 @@ def run_row(row: dict, provider: str, kind: str) -> None:
         with state_lock:
             row["status"] = "done"
             row["email"] = mailbox
+            row["requested_email"] = desired
+            row["suggested"] = bool(suggested)
             row["phone"] = used or row.get("phone") or ""
             row["created_at"] = created
-            row["detail"] = "Mailbox created"
+            row["detail"] = "Suggested mailbox created" if suggested else "Mailbox created"
             state["history"].insert(
                 0,
                 {
@@ -673,10 +696,12 @@ def run_row(row: dict, provider: str, kind: str) -> None:
                     "kind": "WEB.DE" if kind == "webde" else "GMX",
                     "name": f"{row['first']} {row['last']}",
                     "phone": row["phone"],
+                    "suggested": bool(suggested),
+                    "requested_email": desired,
                 },
             )
             save_store()
-        console(row, f"Mailbox created: {mailbox}")
+        console(row, f"Mailbox created: {mailbox}" + (" (suggested)" if suggested else ""))
     except RowCancelled:
         console(row, "Cancelled")
         with state_lock:
@@ -688,6 +713,8 @@ def run_row(row: dict, provider: str, kind: str) -> None:
         message = str(getattr(exc, "code", "") or exc).strip() or "Generation failed"
         email = mailbox_address(str(getattr(exc, "email", "") or ""))
         known = email or str(row.get("email") or "")
+        requested = str(row.get("requested_email") or desired or "").strip()
+        was_suggested = bool(email and requested and email.lower() != requested.lower())
         pop3_failed = (isinstance(exc, MailboxSettingsError) or settings_failure(message)) and "@" in known
         with state_lock:
             row["status"] = "pop3" if pop3_failed else "failed"
@@ -696,6 +723,7 @@ def run_row(row: dict, provider: str, kind: str) -> None:
             row["cancel"] = False
             if email:
                 row["email"] = email
+                row["suggested"] = was_suggested
                 if not row.get("created_at"):
                     row["created_at"] = now_stamp()
                 if not any(item.get("id") == row.get("id") and item.get("email") == email for item in state["history"]):
@@ -710,6 +738,8 @@ def run_row(row: dict, provider: str, kind: str) -> None:
                             "kind": history_kind(row),
                             "name": person_name(row),
                             "phone": row.get("phone") or "",
+                            "suggested": was_suggested,
+                            "requested_email": requested,
                         },
                     )
             save_store()
@@ -854,11 +884,9 @@ def ensure_worker() -> None:
     worker.start()
 
 
-def start_rows(provider: str, kind: str, ids: list[str]) -> dict:
+def start_rows(provider: str, ids: list[str]) -> dict:
     if provider not in PROVIDERS:
         raise ValueError("Choose one number service")
-    if kind not in {"gmx", "webde"}:
-        raise ValueError("Mailbox type must be gmx or webde")
     wanted = {str(item) for item in ids if str(item).strip()}
     if not wanted:
         raise RuntimeError("Select at least one row")
@@ -871,21 +899,51 @@ def start_rows(provider: str, kind: str, ids: list[str]) -> dict:
         for row in state["rows"]:
             if row.get("id") not in wanted or row.get("status") not in {"ready", "failed"}:
                 continue
+            email = str(row.get("requested_email") or row.get("email") or "").strip()
+            kind = kind_from_email(email)
+            if not kind:
+                row["status"] = "failed"
+                row["detail"] = "Email must be a GMX or WEB.DE address"
+                continue
             row["status"] = "queued"
             row["task"] = ""
             row["cancel"] = False
             row["provider"] = provider
             row["kind"] = kind
+            row["requested_email"] = email
+            row["suggested"] = False
             row["detail"] = "Waiting"
             queued += 1
-            console(row, f"Queued on {PROVIDERS[provider]['label']}")
+            console(row, f"Queued on {PROVIDERS[provider]['label']} ({'WEB.DE' if kind == 'webde' else 'GMX'})")
         if not queued:
             raise RuntimeError("Select a row that is waiting or failed")
         state["running"] = True
         state["provider"] = provider
-        state["kind"] = kind
         save_store()
         ensure_worker()
+    return public_state()
+
+
+def remove_rows(ids: list[str]) -> dict:
+    wanted = {str(item) for item in ids if str(item).strip()}
+    if not wanted:
+        raise RuntimeError("Select at least one row")
+    with state_lock:
+        kept: list[dict] = []
+        removed = 0
+        for row in state["rows"]:
+            row_id = str(row.get("id") or "")
+            if row_id not in wanted:
+                kept.append(row)
+                continue
+            if row.get("status") in {"queued", "running"}:
+                raise RuntimeError("Cancel running rows before removing them")
+            removed += 1
+            console(row, "Removed")
+        if not removed:
+            raise RuntimeError("Select a row that is not running")
+        state["rows"] = kept
+        save_store()
     return public_state()
 
 
@@ -1108,6 +1166,7 @@ PAGE = r"""<!DOCTYPE html>
     <span>GMX · WEB.DE</span>
   </div>
   <div class="header-side">
+    <button type="button" class="btn" id="remove-selected" title="Remove selected rows from the table">Remove</button>
     <button type="button" class="btn" id="reload">Reload</button>
     <div class="switch" role="tablist">
       <button type="button" id="tab-generate" class="active">Generate</button>
@@ -1121,12 +1180,6 @@ PAGE = r"""<!DOCTYPE html>
       <div class="fields">
         <label>Service
           <select id="provider"></select>
-        </label>
-        <label>Mailbox
-          <select id="kind">
-            <option value="gmx">GMX</option>
-            <option value="webde">WEB.DE</option>
-          </select>
         </label>
         <label class="reuse" title="After a code arrives, keep the number and use it again until it expires">
           <input id="reuse" type="checkbox">
@@ -1182,7 +1235,6 @@ PAGE = r"""<!DOCTYPE html>
 </main>
 <script>
 const provider = document.querySelector("#provider");
-const kind = document.querySelector("#kind");
 const reuse = document.querySelector("#reuse");
 const queueBody = document.querySelector("#queue");
 const historyBody = document.querySelector("#history-body");
@@ -1215,8 +1267,20 @@ function textCell(value, cls) {
   return `<td class="${cls}" title="${esc(text)}">${esc(text)}</td>`;
 }
 
+function emailCell(row) {
+  const text = String(row.email || "").trim();
+  if (!text) return `<td class="blank">—</td>`;
+  const note = row.suggested ? `<span class="sub">suggested</span>` : "";
+  const title = row.suggested && row.requested_email ? `${text} (requested ${row.requested_email})` : text;
+  return `<td class="mono" title="${esc(title)}">${esc(text)}${note}</td>`;
+}
+
 function canStart(row) {
   return row.status === "ready" || row.status === "failed";
+}
+
+function canRemove(row) {
+  return row.status !== "queued" && row.status !== "running";
 }
 
 function rowAction(row) {
@@ -1237,14 +1301,15 @@ function renderQueue() {
   queueBody.innerHTML = rows.map((row) => {
     const birth = [row.day, row.month, row.year].filter(Boolean).join(".");
     const place = [row.plz, row.city].filter(Boolean).join(" ");
-    const pickable = canStart(row);
+    const pickable = canRemove(row);
+    const kind = row.kind === "webde" ? "WEB.DE" : (row.kind === "gmx" ? "GMX" : "");
     return `<tr>
       <td class="check"><input class="pick" type="checkbox" value="${esc(row.id)}" ${selected.has(row.id) ? "checked" : ""} ${pickable ? "" : "disabled"}></td>
-      <td><span class="who">${esc(row.first)} ${esc(row.last)}</span><span class="sub">${esc(birth)}</span></td>
+      <td><span class="who">${esc(row.first)} ${esc(row.last)}</span><span class="sub">${esc(birth)}${kind ? " · " + esc(kind) : ""}</span></td>
       <td title="${esc(row.street)}"><span class="line">${esc(row.street)}</span><span class="sub">${esc(place)}</span></td>
       <td>${pill(row.status)}</td>
       ${textCell(row.phone, "mono")}
-      ${textCell(row.email, "mono")}
+      ${emailCell(row)}
       ${textCell(row.password, "mono")}
       ${textCell(row.detail, "detail")}
       <td>${rowAction(row)}</td>
@@ -1260,14 +1325,15 @@ function renderQueue() {
   document.querySelector("#summary").innerHTML = bits.join("");
   const startable = rows.filter((row) => canStart(row) && selected.has(row.id));
   document.querySelector("#start-selected").disabled = startable.length === 0;
-  const pickable = rows.filter(canStart);
+  const removable = rows.filter((row) => canRemove(row) && selected.has(row.id));
+  document.querySelector("#remove-selected").disabled = removable.length === 0;
+  const pickable = rows.filter(canRemove);
   const pickAll = document.querySelector("#pick-all");
   pickAll.checked = pickable.length > 0 && pickable.every((row) => selected.has(row.id));
   pickAll.indeterminate = !pickAll.checked && pickable.some((row) => selected.has(row.id));
   pickAll.disabled = pickable.length === 0;
   const busy = rows.some((row) => row.status === "queued" || row.status === "running");
   document.querySelector("#provider").disabled = busy;
-  document.querySelector("#kind").disabled = busy;
 }
 
 function filteredHistory() {
@@ -1285,7 +1351,7 @@ function renderHistory() {
   const rows = filteredHistory();
   historyBody.innerHTML = rows.map((item) => `<tr>
     <td>${esc(item.created_at)}</td>
-    ${textCell(item.email, "mono")}
+    ${emailCell(item)}
     ${textCell(item.password, "mono")}
     <td>${esc(item.name)}</td>
     <td>${esc(item.provider)}<span class="sub">${esc(item.kind)}</span></td>
@@ -1300,7 +1366,6 @@ function applyState(payload) {
   if (!provider.options.length) {
     provider.innerHTML = (latest.providers || []).map((item) => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join("");
     if (latest.provider) provider.value = latest.provider;
-    if (latest.kind) kind.value = latest.kind;
   }
   if (document.activeElement !== reuse) reuse.checked = !!latest.reuse_numbers;
   renderQueue();
@@ -1351,6 +1416,15 @@ document.querySelector("#file").onchange = async (event) => {
   await act("/api/import", {text: await file.text()});
 };
 document.querySelector("#clear").onclick = () => act("/api/clear", {});
+document.querySelector("#remove-selected").onclick = () => {
+  const ids = (latest.rows || []).filter((row) => canRemove(row) && selected.has(row.id)).map((row) => row.id);
+  if (!ids.length) {
+    alert("Select at least one row");
+    return;
+  }
+  ids.forEach((id) => selected.delete(id));
+  act("/api/remove", {ids});
+};
 document.querySelector("#reload").onclick = async () => {
   const button = document.querySelector("#reload");
   button.disabled = true;
@@ -1367,10 +1441,10 @@ document.querySelector("#reload").onclick = async () => {
 document.querySelector("#start-selected").onclick = () => {
   const ids = (latest.rows || []).filter((row) => canStart(row) && selected.has(row.id)).map((row) => row.id);
   ids.forEach((id) => selected.delete(id));
-  act("/api/start", {provider: provider.value, kind: kind.value, ids});
+  act("/api/start", {provider: provider.value, ids});
 };
 document.querySelector("#pick-all").onchange = (event) => {
-  (latest.rows || []).filter(canStart).forEach((row) => {
+  (latest.rows || []).filter(canRemove).forEach((row) => {
     if (event.target.checked) selected.add(row.id);
     else selected.delete(row.id);
   });
@@ -1387,7 +1461,7 @@ queueBody.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-act]");
   if (!button) return;
   if (button.dataset.act === "start") {
-    act("/api/start", {provider: provider.value, kind: kind.value, ids: [button.dataset.id]});
+    act("/api/start", {provider: provider.value, ids: [button.dataset.id]});
     return;
   }
   if (button.dataset.act === "enable") {
@@ -1411,19 +1485,26 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[studio] {fmt % args}", flush=True)
 
     def do_GET(self) -> None:
-        path = self.path.split("?", 1)[0].rstrip("/") or "/"
-        if path == "/":
-            body = PAGE.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if path == "/api/state":
-            self._send(public_state(), 200)
-            return
-        self._send({"ok": False, "error": "not found"}, 404)
+        try:
+            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if path == "/":
+                body = PAGE.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path == "/api/state":
+                self._send(public_state(), 200)
+                return
+            self._send({"ok": False, "error": "not found"}, 404)
+        except Exception:
+            traceback.print_exc()
+            try:
+                self._send({"ok": False, "error": "studio error"}, 500)
+            except Exception:
+                pass
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/")
@@ -1442,7 +1523,7 @@ class Handler(BaseHTTPRequestHandler):
                 raw_ids = body.get("ids") or []
                 if not isinstance(raw_ids, list):
                     raise ValueError("ids must be a list")
-                self._send(start_rows(str(body.get("provider") or ""), str(body.get("kind") or "gmx"), [str(item) for item in raw_ids]), 200)
+                self._send(start_rows(str(body.get("provider") or ""), [str(item) for item in raw_ids]), 200)
                 return
             if path == "/api/enable":
                 self._send(enable_pop3(str(body.get("id") or "")), 200)
@@ -1457,6 +1538,12 @@ class Handler(BaseHTTPRequestHandler):
                     state["rows"] = [row for row in state["rows"] if row.get("status") == "done"]
                     save_store()
                 self._send(public_state(), 200)
+                return
+            if path == "/api/remove":
+                raw_ids = body.get("ids") or []
+                if not isinstance(raw_ids, list):
+                    raise ValueError("ids must be a list")
+                self._send(remove_rows([str(item) for item in raw_ids]), 200)
                 return
             if path == "/api/reload":
                 reload_store()
@@ -1503,21 +1590,51 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class StudioServer(ThreadingHTTPServer):
+    allow_reuse_address = False
+    daemon_threads = True
+
+
+def port_in_use(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        try:
+            return sock.connect_ex((host, port)) == 0
+        except OSError:
+            return False
+
+
 def main() -> None:
     load_store()
+    if port_in_use(HOST, PORT):
+        raise SystemExit(
+            f"Mailbox is already open on port {PORT}. Close the other Mailbox window, then run start-ui.bat again."
+        )
     try:
-        server = ThreadingHTTPServer((HOST, PORT), Handler)
+        server = StudioServer((HOST, PORT), Handler)
     except OSError as exc:
         busy = getattr(exc, "winerror", None) in {10013, 10048} or exc.errno in {13, 48, 98}
         if busy:
-            raise SystemExit(f"Mailbox is already open on port {PORT}.") from exc
+            raise SystemExit(
+                f"Mailbox is already open on port {PORT}. Close the other Mailbox window, then run start-ui.bat again."
+            ) from exc
         raise
     threading.Thread(target=server.serve_forever, name="studio-http", daemon=True).start()
     url = f"http://127.0.0.1:{PORT}"
     print(f"Mailbox window at {url}", flush=True)
     try:
+        with urllib.request.urlopen(url, timeout=3) as response:
+            if response.status != 200:
+                raise RuntimeError(f"HTTP {response.status}")
+    except Exception as exc:
+        server.shutdown()
+        server.server_close()
+        raise SystemExit(f"Mailbox HTTP server did not start on port {PORT}: {exc}") from exc
+    try:
         import webview
     except ImportError as exc:
+        server.shutdown()
+        server.server_close()
         raise SystemExit("Install the window library with: pip install pywebview") from exc
     webview.create_window(
         "Mailbox",

@@ -2214,6 +2214,7 @@ class NumberService:
                 log("Closing numbers that already show an OTP as done")
         pending = list(records)
         results = []
+        missing_hits: dict[str, int] = {}
         deadline = time.time() + CLOSE_WAIT_SECONDS
         next_reload = time.time() + PURCHASES_REFRESH_SECONDS
         while pending and time.time() < deadline:
@@ -2222,6 +2223,7 @@ class NumberService:
             missing = False
             for record in pending:
                 phone = str(record.get("phone") or "")
+                key = digits(phone)
                 icon = "check" if record.get("status") == "coded" else "close"
                 try:
                     action = self.browser.press_row(phone, icon)
@@ -2233,10 +2235,18 @@ class NumberService:
                     self.store.mark(phone, action)
                     results.append({"phone": plus_phone(phone), "action": action})
                     log(f"{plus_phone(phone)} {action}")
-                else:
-                    if action == "missing":
-                        missing = True
-                    still.append(record)
+                    continue
+                if action == "missing":
+                    missing = True
+                    misses = missing_hits.get(key, 0) + 1
+                    missing_hits[key] = misses
+                    # Gone from purchases after a refresh means Hero already dropped it.
+                    if misses >= 2:
+                        self.store.mark(phone, "cancel")
+                        results.append({"phone": plus_phone(phone), "action": "cancel"})
+                        log(f"{plus_phone(phone)} missing from purchases; treating as cancelled")
+                        continue
+                still.append(record)
             pending = still
             if missing and time.time() >= next_reload:
                 try:
@@ -2248,11 +2258,18 @@ class NumberService:
                 next_reload = time.time() + PURCHASES_REFRESH_SECONDS
             if pending:
                 time.sleep(2)
+        forced = []
         for record in pending:
-            results.append({"phone": plus_phone(str(record.get("phone") or "")), "action": "waiting"})
+            phone = str(record.get("phone") or "")
+            # Hero sometimes leaves the cancel control disabled until expiry.
+            # Release the local hold so the next price order is not blocked.
+            self.store.mark(phone, "cancel")
+            forced.append({"phone": plus_phone(phone), "action": "cancel"})
+            log(f"{plus_phone(phone)} still open in Hero; releasing local hold")
+        results.extend(forced)
         closed = [item for item in results if item["action"] in {"done", "cancel"}]
         payload = {"email": email, "results": results}
-        if pending or len(closed) != len(records):
+        if len(closed) != len(records):
             payload["ok"] = False
             payload["error"] = "waiting"
             return payload
@@ -2260,6 +2277,8 @@ class NumberService:
         log(f"Removed {len(removed)} number(s) for {email}")
         payload["removed"] = removed
         payload["ok"] = True
+        if forced:
+            payload["forced"] = True
         return payload
 
 

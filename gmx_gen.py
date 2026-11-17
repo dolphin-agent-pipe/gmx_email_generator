@@ -1166,28 +1166,65 @@ def mailbox_address(value: str) -> str:
     return match.group(0) if match else ""
 
 
+def mailbox_kind(value: str) -> str:
+    domain = email_domain_part(mailbox_address(value) or value)
+    if domain == "web.de":
+        return "webde"
+    if domain.startswith("gmx."):
+        return "gmx"
+    return ""
+
+
 def select_email_domain(cdp: Cdp, domain: str) -> str:
-    wanted = email_domain_part(domain)
+    wanted = email_domain_part(domain) or str(domain or "").strip().lower().lstrip("@")
     if not wanted:
         return ""
-    selected = evaluate(
-        cdp,
-        "(() => {"
-        f" const wanted = {json.dumps(wanted)};"
-        " const selects = [...document.querySelectorAll('select')];"
-        " for (const sel of selects) {"
-        "  const options = [...(sel.options || [])];"
-        "  const match = options.find((opt) => String(opt.value || opt.text || '').replace(/^@/, '').trim().toLowerCase() === wanted);"
-        "  if (!match) continue;"
-        "  sel.value = match.value;"
-        "  sel.dispatchEvent(new Event('input', {bubbles: true}));"
-        "  sel.dispatchEvent(new Event('change', {bubbles: true}));"
-        "  return String(match.value || match.text || '').replace(/^@/, '').trim();"
-        " }"
-        " return '';"
-        "})()",
-    )
-    return str(selected or "")
+
+    def read_domain() -> str:
+        return current_domain_value(cdp)
+
+    if read_domain() == wanted:
+        return wanted
+
+    selected = ""
+    for _attempt in range(5):
+        if not alias_field_present(cdp):
+            time.sleep(0.3)
+            continue
+        selected = evaluate(
+            cdp,
+            "(() => {"
+            f" const wanted = {json.dumps(wanted)};"
+            " const norm = (text) => String(text || '').replace(/^@/, '').trim().toLowerCase();"
+            " const sel = document.querySelector('#domain') || document.querySelector('select[name=\"domain\"]') || document.querySelector('select[data-testid=\"domain-select\"]');"
+            " if (!sel) return '';"
+            " const options = [...(sel.options || [])];"
+            " const match = options.find((opt) => norm(opt.value) === wanted || norm(opt.text) === wanted);"
+            " if (!match) return 'missing:' + options.map((opt) => norm(opt.value || opt.text)).join(',');"
+            " const native = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value');"
+            " if (native && native.set) native.set.call(sel, match.value);"
+            " else sel.value = match.value;"
+            " for (const opt of options) opt.selected = false;"
+            " match.selected = true;"
+            " sel.focus();"
+            " sel.dispatchEvent(new Event('input', {bubbles: true}));"
+            " sel.dispatchEvent(new Event('change', {bubbles: true}));"
+            " return norm(sel.value || match.value || match.text);"
+            "})()",
+        )
+        selected = str(selected or "").replace("@", "").strip()
+        time.sleep(0.45)
+        current = read_domain()
+        if current == wanted:
+            return wanted
+        if selected == wanted and current and current != wanted:
+            # React re-rendered the old value; try once more after the alias field settles.
+            time.sleep(0.5)
+            continue
+        if selected.startswith("missing:"):
+            return current
+        time.sleep(0.2)
+    return read_domain() or (selected if selected and not selected.startswith("missing:") else "")
 
 
 def visible_mailbox(cdp: Cdp, fallback: str) -> str:
@@ -1250,6 +1287,418 @@ def confirm_visible_email(cdp: Cdp, fallback: str) -> str:
     return mailbox
 
 
+def email_suggestions(cdp: Cdp, exclude: str = "") -> list[str]:
+    skipped = mailbox_address(exclude).lower()
+    raw = evaluate(
+        cdp,
+        "(() => {"
+        " const domains = 'web\\\\.de|gmx\\\\.net|gmx\\\\.de|gmx\\\\.com|gmx\\\\.at|gmx\\\\.ch';"
+        " const full = new RegExp('[A-Za-z0-9._%+-]+@(?:' + domains + ')', 'gi');"
+        " const seen = new Set();"
+        " const out = [];"
+        " const add = (value) => {"
+        "  const email = String(value || '').trim();"
+        "  if (!email) return;"
+        "  const key = email.toLowerCase();"
+        "  if (seen.has(key)) return;"
+        "  seen.add(key);"
+        "  out.push(email);"
+        " };"
+        " const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1; };"
+        " for (const el of document.querySelectorAll('button, a, [role=\"button\"], label, li, span, div, p')) {"
+        "  if (!visible(el)) continue;"
+        "  const text = String(el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();"
+        "  if (!text || text.length > 120) continue;"
+        "  const match = text.match(full);"
+        "  if (match) add(match[0]);"
+        " }"
+        " for (const el of document.querySelectorAll('input[type=\"radio\"], option')) {"
+        "  add(el.value);"
+        "  add(el.getAttribute('aria-label'));"
+        "  add(el.innerText || el.textContent);"
+        " }"
+        " return out;"
+        "})()",
+    )
+    found: list[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            email = mailbox_address(str(item or ""))
+            if not email:
+                continue
+            if skipped and email.lower() == skipped:
+                continue
+            found.append(email)
+    return found
+
+
+def click_email_suggestion(cdp: Cdp, email: str) -> bool:
+    wanted = mailbox_address(email)
+    if not wanted:
+        return False
+    clicked = evaluate(
+        cdp,
+        "(() => {"
+        f" const wanted = {json.dumps(wanted.lower())};"
+        " const domains = 'web\\\\.de|gmx\\\\.net|gmx\\\\.de|gmx\\\\.com|gmx\\\\.at|gmx\\\\.ch';"
+        " const full = new RegExp('[A-Za-z0-9._%+-]+@(?:' + domains + ')', 'i');"
+        " const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1; };"
+        " for (const el of document.querySelectorAll('button, a, [role=\"button\"], label, li, span, div, p, input[type=\"radio\"]')) {"
+        "  if (!visible(el)) continue;"
+        "  const text = String(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();"
+        "  const match = text.match(full);"
+        "  if (!match || match[0].toLowerCase() !== wanted) continue;"
+        "  el.click();"
+        "  return true;"
+        " }"
+        " return false;"
+        "})()",
+    )
+    return bool(clicked)
+
+
+def alias_form_open(cdp: Cdp) -> bool:
+    if not alias_field_present(cdp):
+        return False
+    if not element_box(cdp, "#alias"):
+        return False
+    has_domain = bool(
+        evaluate(
+            cdp,
+            "!!document.querySelector('#domain, select[name=\"domain\"], select[data-testid=\"domain-select\"]')",
+        )
+    )
+    return has_domain
+
+
+def congrats_open(cdp: Cdp) -> bool:
+    return bool(
+        evaluate(
+            cdp,
+            "!!(document.querySelector('[data-testid=\"congrats\"], .alias-step__congratuletions-popup, .congrats__email'))",
+        )
+    )
+
+
+def current_domain_value(cdp: Cdp) -> str:
+    raw = evaluate(
+        cdp,
+        "(() => {"
+        " const sel = document.querySelector('#domain, select[name=\"domain\"], select[data-testid=\"domain-select\"]');"
+        " if (!sel) return '';"
+        " return String(sel.value || '').replace(/^@/, '').trim().toLowerCase();"
+        "})()",
+    )
+    return str(raw or "").strip().lower()
+
+
+def alias_field_present(cdp: Cdp) -> bool:
+    return bool(
+        evaluate(
+            cdp,
+            "!!document.querySelector('#alias')",
+        )
+    )
+
+
+def current_alias_mailbox(cdp: Cdp) -> str:
+    if not alias_field_present(cdp):
+        return mailbox_address(visible_mailbox(cdp, ""))
+    local = email_local_part(field_value(cdp, "#alias"))
+    domain = current_domain_value(cdp)
+    if local and domain:
+        return f"{local}@{domain}"
+    return mailbox_address(visible_mailbox(cdp, ""))
+
+
+def click_back_to_email(cdp: Cdp) -> bool:
+    selectors = [
+        "button[data-testid='back-button']",
+        "[data-testid='back-button']",
+        "button[aria-label='Zurück']",
+        "button[aria-label='Zurueck']",
+    ]
+    for _attempt in range(4):
+        for selector in selectors:
+            box = element_box(cdp, selector)
+            if not box:
+                continue
+            mouse_click(cdp, box["x"], box["y"])
+            time.sleep(1.0)
+            if alias_field_present(cdp) and element_box(cdp, "#alias"):
+                return True
+            if not bool(evaluate(cdp, "!!document.querySelector('#PostalCode')")):
+                return True
+        clicked = bool(
+            evaluate(
+                cdp,
+                "(() => {"
+                " const btn = document.querySelector('button[data-testid=\"back-button\"], [data-testid=\"back-button\"]');"
+                " if (!btn) return false;"
+                " btn.removeAttribute('disabled');"
+                " btn.disabled = false;"
+                " btn.click();"
+                " return true;"
+                "})()",
+            )
+        )
+        print(f"Back JS click={clicked}", flush=True)
+        time.sleep(1.0)
+        if alias_field_present(cdp) and element_box(cdp, "#alias"):
+            return True
+        time.sleep(0.4)
+    return bool(alias_field_present(cdp) and element_box(cdp, "#alias"))
+
+
+def address_form_open(cdp: Cdp) -> bool:
+    postal = bool(evaluate(cdp, "!!document.querySelector('#PostalCode')"))
+    gender = bool(evaluate(cdp, "!!(document.querySelector('#FEMALE') || document.querySelector('#city'))"))
+    if not (postal or gender):
+        return False
+    return not (alias_field_present(cdp) and element_box(cdp, "#alias"))
+
+
+def wait_alias_field(cdp: Cdp, seconds: float = 20) -> None:
+    deadline = time.time() + seconds
+    last_log = 0.0
+    while time.time() < deadline:
+        if alias_field_present(cdp) and element_box(cdp, "#alias"):
+            return
+        if address_form_open(cdp):
+            print(f"Address form interrupted email edit: {email_step_debug(cdp)}", flush=True)
+            if click_back_to_email(cdp):
+                print("Returned to the email editor", flush=True)
+                time.sleep(1.0)
+                continue
+            print("Back click missed; retrying", flush=True)
+            time.sleep(0.6)
+            continue
+        now = time.time()
+        if now - last_log > 3:
+            print(f"Waiting for #alias: {email_step_debug(cdp)}", flush=True)
+            last_log = now
+        if congrats_open(cdp):
+            time.sleep(0.3)
+            continue
+        time.sleep(0.2)
+    raise SystemExit(f"Could not find the email field ({email_step_debug(cdp)})")
+
+
+def set_alias_value(cdp: Cdp, local: str) -> str:
+    deadline = time.time() + 16
+    last = ""
+    while time.time() < deadline:
+        if address_form_open(cdp):
+            print(f"Address form interrupted alias typing: {email_step_debug(cdp)}")
+            if click_back_to_email(cdp):
+                print("Returned to the email editor")
+                time.sleep(0.8)
+                continue
+        if alias_field_present(cdp):
+            selector = "#alias"
+        else:
+            selector = email_selector(cdp)
+        if not selector:
+            time.sleep(0.25)
+            continue
+        element_box(cdp, selector)
+        clicked = click_selector(cdp, selector)
+        if clicked:
+            time.sleep(0.1)
+            cdp.call(
+                "Input.dispatchKeyEvent",
+                {"type": "keyDown", "key": "a", "code": "KeyA", "windowsVirtualKeyCode": 65, "modifiers": 2},
+            )
+            cdp.call(
+                "Input.dispatchKeyEvent",
+                {"type": "keyUp", "key": "a", "code": "KeyA", "windowsVirtualKeyCode": 65, "modifiers": 2},
+            )
+            cdp.call(
+                "Input.dispatchKeyEvent",
+                {"type": "keyDown", "key": "Backspace", "code": "Backspace", "windowsVirtualKeyCode": 8},
+            )
+            cdp.call(
+                "Input.dispatchKeyEvent",
+                {"type": "keyUp", "key": "Backspace", "code": "Backspace", "windowsVirtualKeyCode": 8},
+            )
+            cdp.call("Input.insertText", {"text": local})
+            time.sleep(0.2)
+            last = field_value(cdp, selector)
+            if last == local:
+                return local
+        typed = evaluate(
+            cdp,
+            "(() => {"
+            f" const el = document.querySelector({json.dumps(selector)});"
+            " if (!el) return '';"
+            " el.scrollIntoView({block: 'center', inline: 'center'});"
+            " el.focus();"
+            " const native = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');"
+            f" const text = {json.dumps(local)};"
+            " if (native && native.set) native.set.call(el, text);"
+            " else el.value = text;"
+            " for (const type of ['input', 'change']) el.dispatchEvent(new Event(type, {bubbles: true}));"
+            " el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: text}));"
+            " return el.value;"
+            "})()",
+        )
+        last = str(typed or "") or field_value(cdp, selector)
+        if last == local and field_value(cdp, selector) == local:
+            return local
+        time.sleep(0.3)
+    raise SystemExit(f"Could not set email local part to {local!r} (stayed {last!r}; {email_step_debug(cdp)})")
+
+
+def apply_mailbox_choice(cdp: Cdp, email: str) -> str:
+    wanted = mailbox_address(email) or str(email or "").strip()
+    local = email_local_part(wanted)
+    domain = email_domain_part(wanted)
+    if not local:
+        raise SystemExit("Missing email address")
+    wait_alias_field(cdp)
+    if click_email_suggestion(cdp, wanted):
+        time.sleep(0.8)
+        current = current_alias_mailbox(cdp) or visible_mailbox(cdp, wanted)
+        if current.lower() == wanted.lower():
+            print(f"Clicked suggested email {current}")
+            return current
+        print(f"Suggestion click left {current or 'empty'}; typing {wanted}")
+    # Local first. Changing domain while the default local is still present can
+    # make GMX auto-confirm that default address and skip the editor.
+    typed = set_alias_value(cdp, local)
+    if typed != local:
+        raise SystemExit(f"Email local part stayed {typed!r} after typing {local!r}")
+    if domain:
+        selected = select_email_domain(cdp, domain)
+        if selected.lower() != domain.lower():
+            raise SystemExit(
+                f"Could not select email domain @{domain} "
+                f"(stayed @{selected or current_domain_value(cdp) or 'empty'}; {email_step_debug(cdp)})"
+            )
+        print(f"Email domain set to @{selected}", flush=True)
+        time.sleep(0.5)
+        if congrats_open(cdp) or address_form_open(cdp):
+            shown = mailbox_address(visible_mailbox(cdp, "")) or ""
+            if shown.lower() == wanted.lower():
+                print(f"Signup advanced with {shown}", flush=True)
+                return shown
+            print(f"Signup jumped ahead with {shown or 'empty'}; reopening editor", flush=True)
+            if address_form_open(cdp) or bool(evaluate(cdp, "!!document.querySelector('#PostalCode')")):
+                if not click_back_to_email(cdp):
+                    raise SystemExit(f"Could not return to email editor ({email_step_debug(cdp)})")
+            wait_alias_field(cdp)
+        if field_value(cdp, "#alias") != local or current_domain_value(cdp) != domain.lower():
+            if current_domain_value(cdp) != domain.lower():
+                selected = select_email_domain(cdp, domain)
+                if selected.lower() != domain.lower():
+                    raise SystemExit(f"Email domain reset to @{selected or 'empty'}, wanted @{domain}")
+            if field_value(cdp, "#alias") != local:
+                typed = set_alias_value(cdp, local)
+                if typed != local:
+                    raise SystemExit(f"Email local part reset to {typed!r}")
+    evaluate(
+        cdp,
+        "(() => { const el = document.querySelector('#alias'); if (el) { el.dispatchEvent(new Event('blur', {bubbles: true})); el.blur(); } })()",
+    )
+    current = current_alias_mailbox(cdp)
+    if current.lower() != wanted.lower():
+        raise SystemExit(f"Email form stayed {current or 'empty'}, wanted {wanted}")
+    print(f"Email set to {current}", flush=True)
+    ready_until = time.time() + 12
+    while time.time() < ready_until:
+        if address_form_open(cdp) or bool(evaluate(cdp, "!!document.querySelector('#PostalCode')")):
+            shown = mailbox_address(visible_mailbox(cdp, "")) or ""
+            if shown.lower() == wanted.lower():
+                return shown
+            print(f"Address form has {shown or 'empty'}; returning to editor", flush=True)
+            if not click_back_to_email(cdp):
+                break
+            time.sleep(0.8)
+            wait_alias_field(cdp)
+            continue
+        if current_alias_mailbox(cdp).lower() != wanted.lower():
+            if domain and current_domain_value(cdp) != domain.lower():
+                select_email_domain(cdp, domain)
+            if field_value(cdp, "#alias") != local:
+                set_alias_value(cdp, local)
+        state = weiter_state(cdp)
+        if state.get("taken"):
+            break
+        if state.get("found") and not state.get("disabled"):
+            time.sleep(0.8)
+            if current_alias_mailbox(cdp).lower() != wanted.lower():
+                continue
+            state = weiter_state(cdp)
+            if state.get("found") and not state.get("disabled") and not state.get("taken"):
+                break
+        time.sleep(0.35)
+    current = current_alias_mailbox(cdp)
+    if current.lower() != wanted.lower():
+        raise SystemExit(f"Email form drifted to {current or 'empty'}, wanted {wanted}")
+    return current
+
+
+
+
+def email_step_debug(cdp: Cdp) -> str:
+    try:
+        return str(
+            evaluate(
+                cdp,
+                "(() => {"
+                " const alias = document.querySelector('#alias');"
+                " const domain = document.querySelector('#domain, select[name=\"domain\"], select[data-testid=\"domain-select\"]');"
+                " const postal = document.querySelector('#postalCode');"
+                " const congrats = document.querySelector('[data-testid=\"congrats\"], .alias-step__congratuletions-popup, .congrats__email');"
+                " const rect = alias ? alias.getBoundingClientRect() : null;"
+                " const body = document.body ? document.body.innerText : '';"
+                " const ids = [...document.querySelectorAll('input, select, button[data-testid]')].slice(0, 20).map((el) => el.id || el.getAttribute('data-testid') || el.name || el.tagName).filter(Boolean);"
+                " return JSON.stringify({"
+                "  url: location.href,"
+                "  alias: !!alias,"
+                "  aliasValue: alias ? String(alias.value || '') : '',"
+                "  aliasBox: rect ? {w: rect.width, h: rect.height, t: rect.top, l: rect.left} : null,"
+                "  domain: !!domain,"
+                "  domainValue: domain ? String(domain.value || '') : '',"
+                "  postal: !!postal,"
+                "  congrats: !!congrats,"
+                "  taken: body.includes('Leider schon vergeben'),"
+                "  ids: ids,"
+                "  snippet: body.replace(/\\s+/g, ' ').trim().slice(0, 220),"
+                "  title: document.title"
+                " });"
+                "})()",
+            )
+            or ""
+        )
+    except Exception as exc:
+        return f"debug-failed:{exc}"
+
+
+def open_alias_editor(cdp: Cdp) -> None:
+    deadline = time.time() + 45
+    last_log = 0.0
+    while time.time() < deadline:
+        if alias_form_open(cdp):
+            return
+        now = time.time()
+        if now - last_log > 5:
+            print(f"Waiting for email editor: {email_step_debug(cdp)}")
+            last_log = now
+        if address_form_open(cdp) or on_screen(cdp, "#PostalCode") or bool(evaluate(cdp, "!!document.querySelector('#PostalCode')")):
+            if click_back_to_email(cdp):
+                print("Opened the email editor")
+                time.sleep(1.2)
+                continue
+            raise SystemExit(f"Could not open the email editor from the address form ({email_step_debug(cdp)})")
+        if congrats_open(cdp):
+            time.sleep(0.35)
+            continue
+        time.sleep(0.3)
+    raise SystemExit(f"Could not open the email editor ({email_step_debug(cdp)})")
+
+
+
 _accounts_lock = threading.Lock()
 
 
@@ -1284,12 +1733,12 @@ def write_text_atomic(path: Path, text: str) -> None:
             pass
 
 
-def save_account(email: str, password: str) -> None:
+def save_account(email: str, password: str, suggested: bool = False) -> None:
     email = mailbox_address(email)
     if not email:
         raise SystemExit("Could not save the mailbox because the address was incomplete")
     with _accounts_lock:
-        accounts: list[dict[str, str]] = []
+        accounts: list[dict] = []
         if ACCOUNTS_FILE.is_file():
             try:
                 raw = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
@@ -1308,12 +1757,20 @@ def save_account(email: str, password: str) -> None:
             if str(item.get("email") or "").lower() == email.lower():
                 item["email"] = email
                 item["password"] = password
+                if suggested:
+                    item["suggested"] = True
+                else:
+                    item.pop("suggested", None)
                 replaced = True
                 break
         if not replaced:
-            accounts.append({"email": email, "password": password})
+            entry = {"email": email, "password": password}
+            if suggested:
+                entry["suggested"] = True
+            accounts.append(entry)
         write_text_atomic(ACCOUNTS_FILE, json.dumps(accounts, indent=2))
-    print(f"Saved {email} to {ACCOUNTS_FILE.name}")
+    label = f"{email} (suggested)" if suggested else email
+    print(f"Saved {label} to {ACCOUNTS_FILE.name}")
 
 
 def chosen_mailbox(cdp: Cdp, fallback: str) -> str:
@@ -1323,84 +1780,144 @@ def chosen_mailbox(cdp: Cdp, fallback: str) -> str:
     return found
 
 
-def choose_email(cdp: Cdp, desired_email: str) -> str:
+def choose_email(cdp: Cdp, desired_email: str) -> tuple[str, bool]:
     wanted = mailbox_address(desired_email) or str(desired_email or "").strip()
     local = email_local_part(wanted)
     domain = email_domain_part(wanted)
     if not local:
         raise SystemExit("Missing email address")
-    fallback = wanted if "@" in wanted else (f"{local}@{domain}" if domain else local)
-    current = local
-    typed = False
-    deadline = time.time() + 30
-    attempts = 0
+    if not domain:
+        raise SystemExit("Missing email domain")
+    fallback = wanted
+    suggested = False
+    edits = 0
+    deadline = time.time() + 90
     while time.time() < deadline:
-        selector = email_selector(cdp)
-        alias_open = bool(selector) and on_screen(cdp, selector)
-        if not alias_open and on_screen(cdp, "#postalCode"):
-            print("Address form is already open")
-            return chosen_mailbox(cdp, fallback)
-        if alias_open and not typed:
-            try:
-                type_into(cdp, selector, current)
-            except SystemExit:
-                time.sleep(1)
-                selector = email_selector(cdp)
-                if not (selector and on_screen(cdp, selector)) and on_screen(cdp, "#postalCode"):
-                    print("Address form is already open")
-                    return chosen_mailbox(cdp, fallback)
-                raise
-            if domain:
-                selected = select_email_domain(cdp, domain)
-                if selected:
-                    print(f"Email domain set to @{selected}")
-            print(f"Email set to {current}" + (f"@{domain}" if domain else ""))
-            typed = True
-            time.sleep(1.5)
-            continue
+        if address_form_open(cdp):
+            shown = mailbox_address(visible_mailbox(cdp, "")) or ""
+            if shown.lower() == fallback.lower():
+                print(f"Using mailbox {shown}")
+                return shown, suggested or shown.lower() != wanted.lower()
+            print(f"Address form has {shown or 'empty'}, need {fallback}. Going back.")
+            if not click_back_to_email(cdp):
+                raise SystemExit(f"Could not return to the email editor from {shown or 'the address form'}")
+            time.sleep(1.0)
+        open_alias_editor(cdp)
+        current = current_alias_mailbox(cdp)
+        if current.lower() != fallback.lower() or current_domain_value(cdp) != email_domain_part(fallback):
+            fallback = apply_mailbox_choice(cdp, fallback)
+            edits += 1
         state = weiter_state(cdp)
-        if typed and state.get("found") and not state.get("disabled") and not state.get("taken"):
-            return confirm_visible_email(cdp, fallback)
-        needs_change = typed and bool(selector) and (
-            state.get("taken") or (state.get("found") and state.get("disabled"))
-        )
-        if needs_change and not state.get("taken"):
-            time.sleep(3)
-            selector = email_selector(cdp)
-            alias_open = bool(selector) and on_screen(cdp, selector)
-            if not alias_open and on_screen(cdp, "#postalCode"):
-                print("Address form is already open")
-                return chosen_mailbox(cdp, fallback)
-            state = weiter_state(cdp)
-            if state.get("found") and not state.get("disabled") and not state.get("taken"):
-                return confirm_visible_email(cdp, fallback)
-            needs_change = bool(email_selector(cdp)) and (
-                state.get("taken") or (state.get("found") and state.get("disabled"))
-            )
-            selector = email_selector(cdp)
-        if needs_change:
-            if attempts >= 8:
-                raise SystemExit("Weiter stayed disabled after changing the email")
-            attempts += 1
-            base = field_value(cdp, selector).strip() or current
-            updated = tweak_email(base if "@" not in base else base.split("@", 1)[0])
-            current = email_local_part(updated)
-            fallback = f"{current}@{domain}" if domain else current
-            try:
-                type_into(cdp, selector, current)
-            except SystemExit:
-                time.sleep(1)
-                selector = email_selector(cdp)
-                if not (selector and on_screen(cdp, selector)) and on_screen(cdp, "#postalCode"):
-                    print("Address form is already open")
-                    return chosen_mailbox(cdp, fallback)
-                raise
-            if domain:
-                select_email_domain(cdp, domain)
-            print(f"Email updated to {current}" + (f"@{domain}" if domain else ""))
-            time.sleep(1.5)
+        if state.get("taken"):
+            if edits >= 8:
+                raise SystemExit("Email stayed taken after trying suggestions")
+            options = email_suggestions(cdp, exclude=wanted if not suggested else fallback)
+            same_domain = [item for item in options if email_domain_part(item) == domain]
+            options = same_domain or [item for item in options if email_domain_part(item)]
+            if not options:
+                raise SystemExit("Email is taken and no suggestion was shown")
+            pick = options[0]
+            print(f"Email taken. Using suggested {pick}")
+            fallback = apply_mailbox_choice(cdp, pick)
+            suggested = True
+            edits += 1
             continue
-        time.sleep(0.4)
+        if not (state.get("found") and not state.get("disabled")):
+            time.sleep(0.5)
+            continue
+        before = current_alias_mailbox(cdp) or fallback
+        if before.lower() != fallback.lower() or current_domain_value(cdp) != email_domain_part(fallback):
+            fallback = apply_mailbox_choice(cdp, fallback)
+            continue
+        print(f"Confirming mailbox {before} before Weiter")
+        clicked_next = click_selector(
+            cdp,
+            "button[aria-label='Weiter'][data-testid='next-button'], button[data-testid='next-button']",
+        )
+        if not clicked_next:
+            clicked_next = bool(
+                evaluate(
+                    cdp,
+                    "(() => {"
+                    " const button = [...document.querySelectorAll(\"button[data-testid='next-button']\")]"
+                    "  .find((el) => /Weiter/i.test((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || '')));"
+                    " if (!button || button.disabled) return false;"
+                    " button.click();"
+                    " return true;"
+                    "})()",
+                )
+            )
+        if not clicked_next:
+            raise SystemExit("Could not find the Weiter button")
+        print(f"Clicked Weiter with {before}")
+        moved = False
+        wait_until = time.time() + 45
+        next_retries = 0
+        last_progress = time.time()
+        while time.time() < wait_until:
+            postal_present = bool(
+                evaluate(
+                    cdp,
+                    "!!(document.querySelector('#PostalCode') || document.querySelector('#FEMALE') || document.querySelector('#city'))",
+                )
+            )
+            if postal_present:
+                print("Address form opened")
+                element_box(cdp, "#PostalCode")
+                moved = True
+                break
+            if alias_form_open(cdp) and weiter_state(cdp).get("taken"):
+                break
+            if congrats_open(cdp):
+                time.sleep(0.4)
+                continue
+            if alias_form_open(cdp) and next_retries < 4:
+                state = weiter_state(cdp)
+                if state.get("found") and not state.get("disabled") and not state.get("taken"):
+                    next_retries += 1
+                    print(f"Retrying Weiter ({next_retries})")
+                    if not click_selector(cdp, "button[aria-label='Weiter'][data-testid='next-button'], button[data-testid='next-button']"):
+                        evaluate(
+                            cdp,
+                            "(() => {"
+                            " const button = [...document.querySelectorAll(\"button[data-testid='next-button']\")]"
+                            "  .find((el) => /Weiter/i.test((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || '')));"
+                            " if (button && !button.disabled) button.click();"
+                            "})()",
+                        )
+                    last_progress = time.time()
+                    time.sleep(1.5)
+                    continue
+            if time.time() - last_progress > 8:
+                print(f"Still waiting for address form: {email_step_debug(cdp)}")
+                last_progress = time.time()
+            time.sleep(0.3)
+        if not moved:
+            postal_present = bool(
+                evaluate(
+                    cdp,
+                    "!!(document.querySelector('#PostalCode') || document.querySelector('#FEMALE') || document.querySelector('#city'))",
+                )
+            )
+            if postal_present:
+                print("Address form opened")
+                moved = True
+        if alias_form_open(cdp) and weiter_state(cdp).get("taken") and not moved:
+            continue
+        if not moved:
+            raise SystemExit(f"Address form did not open after the email step ({email_step_debug(cdp)})")
+        final = mailbox_address(visible_mailbox(cdp, before)) or before
+        if final.lower() != before.lower() and edits < 6:
+            print(f"Signup kept {final} instead of {before}. Retrying.")
+            if not click_selector(cdp, "button[data-testid='back-button'], [data-testid='back-button']"):
+                raise SystemExit(f"Signup kept {final} instead of {before}")
+            time.sleep(1.2)
+            edits += 1
+            continue
+        if final.lower() != wanted.lower():
+            suggested = True
+        print(f"Using mailbox {final}")
+        return final, suggested
     raise SystemExit("Could not get past the email step")
 
 
@@ -1475,10 +1992,15 @@ def select_option(cdp: Cdp, selector: str, value: str) -> str:
         "(() => {"
         f" const el = document.querySelector({json.dumps(selector)});"
         " if (!el) return '';"
-        f" el.value = {json.dumps(value)};"
+        f" const wanted = {json.dumps(value)};"
+        " const norm = (text) => String(text || '').replace(/^@/, '').trim().toLowerCase();"
+        " const options = [...(el.options || [])];"
+        " const match = options.find((opt) => norm(opt.value) === norm(wanted) || norm(opt.text) === norm(wanted));"
+        " if (match) el.value = match.value;"
+        " else el.value = wanted;"
         " el.dispatchEvent(new Event('input', {bubbles: true}));"
         " el.dispatchEvent(new Event('change', {bubbles: true}));"
-        " return el.value;"
+        " return String(el.value || '').replace(/^@/, '').trim();"
         "})()",
     )
     return str(selected or "")
@@ -3144,7 +3666,7 @@ def fill_signup(
     password: str,
     port: int,
     phone_step=None,
-) -> str:
+) -> tuple[str, bool]:
     accept_cookies(cdp, timeout=3)
     deadline = time.time() + 30
     while time.time() < deadline and not element_box(cdp, "#firstName"):
@@ -3200,7 +3722,7 @@ def fill_signup(
         print(signup_buttons(cdp).encode("ascii", errors="replace").decode("ascii"))
         raise SystemExit("Could not find the Get started button")
     print("Clicked Get started")
-    mailbox = choose_email(cdp, email)
+    mailbox, suggested = choose_email(cdp, email)
     pause = random.uniform(3, 4)
     print(f"Waiting {pause:.1f}s before the address form")
     time.sleep(pause)
@@ -3222,7 +3744,7 @@ def fill_signup(
                 except (RuntimeError, TimeoutError, OSError):
                     known = ""
             if known:
-                save_account(known, password)
+                save_account(known, password, suggested=suggested)
             raise MailboxSettingsError(known, message) from exc
         raise
     deadline = time.time() + 10
@@ -3234,8 +3756,12 @@ def fill_signup(
         time.sleep(0.5)
     if not final:
         raise SystemExit("Could not read the created mailbox")
-    print(f"Created mailbox {final}")
-    return final
+    if mailbox_address(final) and mailbox_address(email):
+        if mailbox_address(final).lower() != mailbox_address(email).lower():
+            suggested = True
+    label = f"{final} (suggested)" if suggested else final
+    print(f"Created mailbox {label}")
+    return final, suggested
 
 
 def verify_supplied_phones(gmx: Cdp, phones: list[str], fetch_code, log=print, stop=None) -> str:
@@ -3327,7 +3853,7 @@ def generate_mailbox(
     headless: bool = False,
     skip_check: bool = True,
     desired_email: str = "",
-) -> tuple[str, str]:
+) -> tuple[str, str, bool]:
     profile = normalize_profile_name(profile)
     first_name = normalize_name(first_name, "First name")
     last_name = normalize_name(last_name, "Last name")
@@ -3363,6 +3889,7 @@ def generate_mailbox(
     profile_id = create_profile(api, profile, proxy, resolved)
     ws: CdpSocket | None = None
     cdp: Cdp | None = None
+    suggested = False
     try:
         automation = start_profile(session, profile_id, headless)
         port = int(automation["port"])
@@ -3382,7 +3909,7 @@ def generate_mailbox(
             show_profile_window(profile_id)
         navigate(cdp, url)
         open_registration(cdp)
-        mailbox = fill_signup(
+        mailbox, suggested = fill_signup(
             cdp,
             wanted_email,
             first_name,
@@ -3401,9 +3928,9 @@ def generate_mailbox(
     except BaseException:
         finish_profile(session, api, profile_id, cdp, ws)
         raise
-    save_account(mailbox, password)
+    save_account(mailbox, password, suggested=suggested)
     finish_profile(session, api, profile_id, cdp, ws)
-    return mailbox, used["phone"]
+    return mailbox, used["phone"], suggested
 
 
 def ask(value: str | None, label: str) -> str:
@@ -3483,6 +4010,9 @@ def main() -> None:
     desired_mailbox = mailbox_address(ask(args.mailbox, "Mailbox address"))
     if not desired_mailbox:
         raise SystemExit("Mailbox must be a GMX or WEB.DE address")
+    kind = mailbox_kind(desired_mailbox)
+    if not kind:
+        raise SystemExit("Mailbox must be a GMX or WEB.DE address")
     first_name = normalize_name(ask(args.first_name, "First name"), "First name")
     last_name = normalize_name(ask(args.last_name, "Last name"), "Last name")
     day, month, year = normalize_birth(
@@ -3508,7 +4038,11 @@ def main() -> None:
     password = ask(args.password, "Password")
     if not password or len(password) > 100:
         raise SystemExit("Password must be 1 to 100 characters")
-    if not args.url:
+    webde_url = os.environ.get("WEBDE_URL", "https://www.web.de/").strip()
+    signup_url = args.url
+    if not signup_url or signup_url == TARGET_URL1:
+        signup_url = webde_url if kind == "webde" else TARGET_URL1
+    if not signup_url:
         raise SystemExit(f"Set TARGET_URL1 in {ENV_FILE}")
 
     proxy = load_random_proxy(Path(args.proxies))
@@ -3522,6 +4056,7 @@ def main() -> None:
     ws: CdpSocket | None = None
     cdp: Cdp | None = None
     mailbox = desired_mailbox
+    suggested = False
     try:
         automation = start_profile(session, profile_id, args.headless)
         port = int(automation["port"])
@@ -3536,9 +4071,9 @@ def main() -> None:
         if not args.headless:
             maximize_window(cdp, target_id)
             show_profile_window(profile_id)
-        navigate(cdp, args.url)
+        navigate(cdp, signup_url)
         open_registration(cdp)
-        mailbox = fill_signup(
+        mailbox, suggested = fill_signup(
             cdp,
             desired_mailbox,
             first_name,
@@ -3565,7 +4100,7 @@ def main() -> None:
                 pass
         print("Browser left open.")
         raise
-    save_account(mailbox, password)
+    save_account(mailbox, password, suggested=suggested)
     finish_profile(session, api, profile_id, cdp, ws)
 
 

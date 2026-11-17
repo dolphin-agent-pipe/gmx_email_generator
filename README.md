@@ -97,13 +97,17 @@ email;first;last;day;month;year;plz;city;street;password;country
 
 ```
 lena.hoffmann91@gmx.net;Lena;Hoffmann;12;3;1991;80331;Muenchen;Sendlinger Str. 8;RoteWelle27?Haus
+jonas.keller94@web.de;Jonas;Keller;2;8;1994;10115;Berlin;Invalidenstr. 12;BlauFeld18!Haus
+mara.vogel89@gmx.de;Mara;Vogel;21;11;1989;20095;Hamburg;Moenckebergstr. 5;HafenLicht44#Tor
 ```
 
-The email must be a GMX or WEB.DE address and must match the mailbox type you start (`@gmx.*` for GMX, `@web.de` for WEB.DE). Limits: names 1–40 characters, street 1–49, postal code 1–10, password 1–100. The birth date must be 18 or older. GMX and WEB.DE expect a password of at least 12 characters with letters, numbers, and symbols.
+The email domain chooses the provider automatically: `@gmx.net` / `@gmx.de` (and other `@gmx.*`) open GMX, `@web.de` opens WEB.DE. A mixed import can run in one batch. Limits: names 1–40 characters, street 1–49, postal code 1–10, password 1–100. The birth date must be 18 or older. GMX and WEB.DE expect a password of at least 12 characters with letters, numbers, and symbols.
+
+If the requested address is already taken, signup uses the provider's suggested address and marks that row **suggested**.
 
 In the window:
 
-1. Choose **Service** and **Mailbox** (GMX or WEB.DE). One service is used for the rows you start.
+1. Choose **Service**. Mailbox type comes from each row's email domain.
 2. Import the file. A line with a missing field is marked failed and shows what is missing.
 3. Select the rows and click **Start selected**, or **Start** on one row. The chosen service must already be listening. Ready and failed rows can be started. Done rows stay done.
 4. **Cancel** stops a queued or running row. A queued row returns to ready. A running row stops at the next check.
@@ -115,7 +119,7 @@ In the window:
 
 While a row runs it orders three numbers, opens a Dolphin profile, and walks the signup form. If GMX or WEB.DE rejects a number, or no SMS arrives, the next number is tried. When all three fail, the open order is closed and the next cheaper price is ordered. After three failed batches the row is marked failed.
 
-A finished mailbox is written to `accounts.json` and to History. Signup uses the imported email address. If that alias is taken, a short random suffix is added. The Dolphin profile is then closed and deleted.
+A finished mailbox is written to `accounts.json` and to History. Signup uses the imported email address. If that alias is taken, the provider suggestion is used and stored with `"suggested": true`. The Dolphin profile is then closed and deleted.
 
 If the mailbox is created but POP3/IMAP does not turn on, the row stays on **POP3 failed** and shows **Enable POP3/IMAP**. That signs in again and retries the setting. You can also do that for a saved mailbox:
 
