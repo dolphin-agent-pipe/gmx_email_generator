@@ -700,6 +700,67 @@ def click_selector(cdp: Cdp, selector: str) -> bool:
     return True
 
 
+def cancel_contract_page(url: str) -> bool:
+    text = str(url or "").lower()
+    return "kuendig" in text or "kündig" in text or "widerruf" in text
+
+
+def leave_cancel_contract_page(cdp: Cdp) -> bool:
+    if not cancel_contract_page(page_url(cdp)):
+        return False
+    print(f"Left cancel-contract page {page_url(cdp)}")
+    try:
+        cdp.call("Page.enable")
+        history = cdp.call("Page.getNavigationHistory")
+        index = int(history.get("currentIndex") or 0)
+        entries = history.get("entries") or []
+        if index > 0 and isinstance(entries[index - 1], dict):
+            cdp.call("Page.navigateToHistoryEntry", {"entryId": entries[index - 1].get("id")})
+            time.sleep(1.2)
+            return not cancel_contract_page(page_url(cdp))
+    except (RuntimeError, TimeoutError, TypeError, ValueError, IndexError):
+        pass
+    try:
+        evaluate(cdp, "history.back()")
+        time.sleep(1.2)
+    except (RuntimeError, TimeoutError):
+        return False
+    return not cancel_contract_page(page_url(cdp))
+
+
+def click_next_button(cdp: Cdp) -> bool:
+    """Click the real signup Weiter control without hitting footer links."""
+    if cancel_contract_page(page_url(cdp)):
+        leave_cancel_contract_page(cdp)
+    clicked = bool(
+        evaluate(
+            cdp,
+            "(() => {"
+            " const bad = /kuendig|kündig|widerruf|impressum|datenschutz|barrierefreiheit|agb/i;"
+            " const buttons = [...document.querySelectorAll(\"button[data-testid='next-button'], button[aria-label='Weiter']\")];"
+            " const match = buttons.find((el) => {"
+            "  const label = ((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || '')).replace(/\\s+/g, ' ').trim();"
+            "  if (!/Weiter|Jetzt starten|Zustimmen/i.test(label)) return false;"
+            "  if (bad.test(label)) return false;"
+            "  if (el.disabled || el.getAttribute('aria-disabled') === 'true') return false;"
+            "  const r = el.getBoundingClientRect();"
+            "  return r.width > 1 && r.height > 1;"
+            " });"
+            " if (!match) return false;"
+            " match.scrollIntoView({block: 'center', inline: 'center'});"
+            " match.click();"
+            " return true;"
+            "})()",
+        )
+    )
+    if clicked:
+        time.sleep(0.4)
+        if cancel_contract_page(page_url(cdp)):
+            leave_cancel_contract_page(cdp)
+            return False
+    return clicked
+
+
 def field_value(cdp: Cdp, selector: str) -> str:
     value = evaluate(cdp, f"(document.querySelector({json.dumps(selector)}) || {{}}).value || ''")
     return str(value or "")
@@ -1278,7 +1339,7 @@ def visible_mailbox(cdp: Cdp, fallback: str) -> str:
 
 def confirm_visible_email(cdp: Cdp, fallback: str) -> str:
     captured = visible_mailbox(cdp, fallback)
-    if not click_selector(cdp, "button[aria-label='Weiter'][data-testid='next-button']"):
+    if not click_next_button(cdp):
         raise SystemExit("Could not find the Weiter button")
     print("Clicked Weiter")
     mailbox = visible_mailbox(cdp, captured or fallback)
@@ -1341,13 +1402,18 @@ def click_email_suggestion(cdp: Cdp, email: str) -> bool:
         "(() => {"
         f" const wanted = {json.dumps(wanted.lower())};"
         " const domains = 'web\\\\.de|gmx\\\\.net|gmx\\\\.de|gmx\\\\.com|gmx\\\\.at|gmx\\\\.ch';"
-        " const full = new RegExp('[A-Za-z0-9._%+-]+@(?:' + domains + ')', 'i');"
-        " const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1; };"
-        " for (const el of document.querySelectorAll('button, a, [role=\"button\"], label, li, span, div, p, input[type=\"radio\"]')) {"
+        " const full = new RegExp('^\\\\s*[A-Za-z0-9._%+-]+@(?:' + domains + ')\\\\s*$', 'i');"
+        " const bad = /kuendig|kündig|widerruf|impressum|datenschutz|barrierefreiheit|\\bagb\\b/i;"
+        " const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 1 && r.height > 1 && r.width < 420 && r.height < 90; };"
+        " const nodes = [...document.querySelectorAll('button, [role=\"button\"], label, li, span, input[type=\"radio\"]')];"
+        " for (const el of nodes) {"
         "  if (!visible(el)) continue;"
+        "  if (el.closest('a[href*=\"kuendig\"], a[href*=\"kuendigung\"], a[href*=\"widerruf\"], footer')) continue;"
+        "  const key = ((el.id || '') + ' ' + (el.getAttribute('data-testid') || '') + ' ' + (el.className || '')).toLowerCase();"
         "  const text = String(el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();"
-        "  const match = text.match(full);"
-        "  if (!match || match[0].toLowerCase() !== wanted) continue;"
+        "  if (!text || text.length > 80 || bad.test(text)) continue;"
+        "  if (!full.test(text) || text.toLowerCase() !== wanted) continue;"
+        "  if (!(key.includes('chip') || key.includes('suggest') || el.tagName === 'BUTTON' || el.getAttribute('role') === 'button' || el.tagName === 'LABEL' || el.tagName === 'INPUT')) continue;"
         "  el.click();"
         "  return true;"
         " }"
@@ -1412,31 +1478,25 @@ def current_alias_mailbox(cdp: Cdp) -> str:
 
 
 def click_back_to_email(cdp: Cdp) -> bool:
-    selectors = [
-        "button[data-testid='back-button']",
-        "[data-testid='back-button']",
-        "button[aria-label='Zurück']",
-        "button[aria-label='Zurueck']",
-    ]
+    if cancel_contract_page(page_url(cdp)):
+        leave_cancel_contract_page(cdp)
     for _attempt in range(4):
-        for selector in selectors:
-            box = element_box(cdp, selector)
-            if not box:
-                continue
-            mouse_click(cdp, box["x"], box["y"])
-            time.sleep(1.0)
-            if alias_field_present(cdp) and element_box(cdp, "#alias"):
-                return True
-            if not bool(evaluate(cdp, "!!document.querySelector('#PostalCode')")):
-                return True
         clicked = bool(
             evaluate(
                 cdp,
                 "(() => {"
-                " const btn = document.querySelector('button[data-testid=\"back-button\"], [data-testid=\"back-button\"]');"
+                " const bad = /kuendig|kündig|widerruf|impressum|datenschutz|barrierefreiheit|\\bagb\\b/i;"
+                " const nodes = [...document.querySelectorAll("
+                "  'button[data-testid=\"back-button\"], button[aria-label=\"Zurück\"], button[aria-label=\"Zurueck\"]'"
+                " )];"
+                " const btn = nodes.find((el) => {"
+                "  const label = ((el.getAttribute('data-testid') || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.innerText || '')).replace(/\\s+/g, ' ').trim();"
+                "  if (bad.test(label)) return false;"
+                "  const r = el.getBoundingClientRect();"
+                "  return r.width > 1 && r.height > 1;"
+                " });"
                 " if (!btn) return false;"
-                " btn.removeAttribute('disabled');"
-                " btn.disabled = false;"
+                " btn.scrollIntoView({block: 'center', inline: 'center'});"
                 " btn.click();"
                 " return true;"
                 "})()",
@@ -1444,7 +1504,12 @@ def click_back_to_email(cdp: Cdp) -> bool:
         )
         print(f"Back JS click={clicked}", flush=True)
         time.sleep(1.0)
+        if cancel_contract_page(page_url(cdp)):
+            leave_cancel_contract_page(cdp)
+            continue
         if alias_field_present(cdp) and element_box(cdp, "#alias"):
+            return True
+        if not bool(evaluate(cdp, "!!document.querySelector('#PostalCode')")):
             return True
         time.sleep(0.4)
     return bool(alias_field_present(cdp) and element_box(cdp, "#alias"))
@@ -1830,24 +1895,7 @@ def choose_email(cdp: Cdp, desired_email: str) -> tuple[str, bool]:
             fallback = apply_mailbox_choice(cdp, fallback)
             continue
         print(f"Confirming mailbox {before} before Weiter")
-        clicked_next = click_selector(
-            cdp,
-            "button[aria-label='Weiter'][data-testid='next-button'], button[data-testid='next-button']",
-        )
-        if not clicked_next:
-            clicked_next = bool(
-                evaluate(
-                    cdp,
-                    "(() => {"
-                    " const button = [...document.querySelectorAll(\"button[data-testid='next-button']\")]"
-                    "  .find((el) => /Weiter/i.test((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || '')));"
-                    " if (!button || button.disabled) return false;"
-                    " button.click();"
-                    " return true;"
-                    "})()",
-                )
-            )
-        if not clicked_next:
+        if not click_next_button(cdp):
             raise SystemExit("Could not find the Weiter button")
         print(f"Clicked Weiter with {before}")
         moved = False
@@ -1855,6 +1903,12 @@ def choose_email(cdp: Cdp, desired_email: str) -> tuple[str, bool]:
         next_retries = 0
         last_progress = time.time()
         while time.time() < wait_until:
+            if cancel_contract_page(page_url(cdp)):
+                if not leave_cancel_contract_page(cdp):
+                    raise SystemExit(f"Signup opened cancel-contract page {page_url(cdp)}")
+                print("Recovered from cancel-contract page after email step")
+                next_retries = 0
+                continue
             postal_present = bool(
                 evaluate(
                     cdp,
@@ -1876,15 +1930,7 @@ def choose_email(cdp: Cdp, desired_email: str) -> tuple[str, bool]:
                 if state.get("found") and not state.get("disabled") and not state.get("taken"):
                     next_retries += 1
                     print(f"Retrying Weiter ({next_retries})")
-                    if not click_selector(cdp, "button[aria-label='Weiter'][data-testid='next-button'], button[data-testid='next-button']"):
-                        evaluate(
-                            cdp,
-                            "(() => {"
-                            " const button = [...document.querySelectorAll(\"button[data-testid='next-button']\")]"
-                            "  .find((el) => /Weiter/i.test((el.getAttribute('aria-label') || '') + ' ' + (el.innerText || '')));"
-                            " if (button && !button.disabled) button.click();"
-                            "})()",
-                        )
+                    click_next_button(cdp)
                     last_progress = time.time()
                     time.sleep(1.5)
                     continue
@@ -1909,7 +1955,7 @@ def choose_email(cdp: Cdp, desired_email: str) -> tuple[str, bool]:
         final = mailbox_address(visible_mailbox(cdp, before)) or before
         if final.lower() != before.lower() and edits < 6:
             print(f"Signup kept {final} instead of {before}. Retrying.")
-            if not click_selector(cdp, "button[data-testid='back-button'], [data-testid='back-button']"):
+            if not click_back_to_email(cdp):
                 raise SystemExit(f"Signup kept {final} instead of {before}")
             time.sleep(1.2)
             edits += 1
@@ -1967,7 +2013,7 @@ def fill_address(cdp: Cdp, postal_code: str, city: str, street: str, country: st
     type_into(cdp, "#street", street)
     select_country(cdp, country)
     print(f"Filled {postal_code} {city}, {street}")
-    if not click_selector(cdp, "button[aria-label='Weiter'][data-testid='next-button']"):
+    if not click_next_button(cdp):
         raise SystemExit("Could not find the address Weiter button")
     print("Clicked Weiter")
 
@@ -1981,7 +2027,7 @@ def fill_password(cdp: Cdp, password: str) -> None:
     type_into(cdp, "#password", password)
     type_into(cdp, "#confirmPassword", password)
     print("Filled password and confirmation")
-    if not click_selector(cdp, "button[aria-label='Weiter'][data-testid='next-button']"):
+    if not click_next_button(cdp):
         raise SystemExit("Could not find the password Weiter button")
     print("Clicked Weiter")
 
@@ -2430,6 +2476,8 @@ def page_url(cdp: Cdp) -> str:
 
 
 def registration_failed(url: str) -> bool:
+    if cancel_contract_page(url):
+        return True
     parsed = urllib.parse.urlparse(url)
     if parsed.netloc.lower() not in {"hilfe.gmx.net", "hilfe.web.de"}:
         return False
@@ -2615,7 +2663,7 @@ def submit_confirmation_code(cdp: Cdp, code: str) -> str:
     for index, character in enumerate(code[:6]):
         type_into(cdp, f"[name='confirmationCode.{index}.digit']", character)
     print("Entered confirmation code")
-    if not click_selector(cdp, "button[aria-label='Weiter'][data-testid='next-button']"):
+    if not click_next_button(cdp):
         raise SystemExit("Could not find the confirmation Weiter button")
     print("Clicked Weiter")
     print("Waiting 2s before the consent button")
@@ -3701,7 +3749,7 @@ def fill_signup(
         if registration_failed(page_url(cdp)):
             print(f"Registration was sent to {page_url(cdp)}")
             raise SystemExit("Registration was sent to the help page")
-        if click_selector(cdp, "button[data-testid='next-button'], [data-testid='next-button']"):
+        if click_next_button(cdp):
             clicked = True
             break
         checkbox = "#captchafox .cf-checkbox, #captchafox [role='checkbox'], #captchafox iframe, iframe[src*='captchafox']"

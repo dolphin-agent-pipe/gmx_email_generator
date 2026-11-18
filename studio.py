@@ -83,7 +83,12 @@ EMAIL_RE = re.compile(
 
 state_lock = threading.Lock()
 order_lock = threading.Lock()
-state: dict = {"rows": [], "history": [], "running": False, "provider": "smscode", "kind": "gmx"}
+state: dict = {
+    "rows": [], "history": [], "running": False,
+    "provider": "smscode", "kind": "gmx",
+    "target_success": 0, "batch_start": 0.0,
+    "max_concurrent": 1,
+}
 worker: threading.Thread | None = None
 inflight = 0
 store_blocked = False
@@ -331,6 +336,11 @@ def reload_store() -> None:
 
 def public_state() -> dict:
     with state_lock:
+        done_count = sum(1 for r in state["rows"] if r.get("status") == "done")
+        target = state.get("target_success", 0)
+        batch_start = state.get("batch_start", 0.0)
+        elapsed = time.time() - batch_start if batch_start else 0.0
+        time_left = max(0.0, 24 * 3600 - elapsed) if target > 0 and batch_start else 0.0
         return {
             "running": state["running"],
             "provider": state["provider"],
@@ -340,6 +350,10 @@ def public_state() -> dict:
             "history": list(state["history"]),
             "reuse_numbers": live_numbers.enabled(),
             "live_count": live_numbers.live_count(),
+            "target_success": target,
+            "done_count": done_count,
+            "time_left": int(time_left),
+            "max_concurrent": state.get("max_concurrent", 1),
         }
 
 
@@ -837,12 +851,58 @@ def worker_loop() -> None:
         started = False
         try:
             with state_lock:
+                max_concurrent = state.get("max_concurrent", 1)
+                if inflight >= max_concurrent:
+                    pass  # handled below — release lock and wait
+            if inflight >= max_concurrent:
+                time.sleep(0.3)
+                continue
+            with state_lock:
+                target = state.get("target_success", 0)
+                batch_start = state.get("batch_start", 0.0)
+                elapsed = time.time() - batch_start if batch_start else 0.0
+                deadline_reached = target > 0 and elapsed >= 24 * 3600
+                done_count = sum(1 for r in state["rows"] if r.get("status") == "done")
+                target_met = target > 0 and done_count >= target
+
+                if deadline_reached and not target_met:
+                    print(f"[worker] 24-Stunden-Grenze erreicht. {done_count}/{target} erfolgreich.", flush=True)
+                    state["running"] = False
+                    state["target_success"] = 0
+                    state["batch_start"] = 0.0
+                    save_store()
+                    return
+
+                if target_met:
+                    print(f"[worker] Ziel erreicht: {done_count}/{target} erfolgreich.", flush=True)
+                    state["running"] = False
+                    state["target_success"] = 0
+                    state["batch_start"] = 0.0
+                    save_store()
+                    return
+
                 row = next((item for item in state["rows"] if item.get("status") == "queued"), None)
                 if row is None:
                     if inflight == 0:
-                        state["running"] = False
-                        save_store()
-                        return
+                        if target > 0 and not target_met and not deadline_reached:
+                            retried = 0
+                            for r in state["rows"]:
+                                prev_status = r.get("status")
+                                if prev_status in {"failed", "pop3"} and not r.get("cancel"):
+                                    r["status"] = "queued"
+                                    r["task"] = "pop3" if prev_status == "pop3" else ""
+                                    r["cancel"] = False
+                                    r["detail"] = "Wartet (Wiederholung)"
+                                    retried += 1
+                            if retried:
+                                save_store()
+                                print(f"[worker] {retried} Zeile(n) werden wiederholt ({done_count}/{target} fertig).", flush=True)
+                            else:
+                                print(f"[worker] Keine Zeilen zum Wiederholen. Warte…", flush=True)
+                        else:
+                            state["running"] = False
+                            save_store()
+                            return
                 elif row.get("cancel"):
                     row["status"] = "pop3" if row.get("task") == "pop3" else "ready"
                     row["cancel"] = False
@@ -884,7 +944,7 @@ def ensure_worker() -> None:
     worker.start()
 
 
-def start_rows(provider: str, ids: list[str]) -> dict:
+def start_rows(provider: str, ids: list[str], target: int = 0) -> dict:
     if provider not in PROVIDERS:
         raise ValueError("Choose one number service")
     wanted = {str(item) for item in ids if str(item).strip()}
@@ -919,6 +979,13 @@ def start_rows(provider: str, ids: list[str]) -> dict:
             raise RuntimeError("Select a row that is waiting or failed")
         state["running"] = True
         state["provider"] = provider
+        if target > 0:
+            state["target_success"] = target
+            state["batch_start"] = time.time()
+            print(f"[worker] Ziel: {target} erfolgreiche Mailboxen innerhalb von 24 Stunden.", flush=True)
+        else:
+            state["target_success"] = 0
+            state["batch_start"] = 0.0
         save_store()
         ensure_worker()
     return public_state()
@@ -1189,6 +1256,14 @@ PAGE = r"""<!DOCTYPE html>
       <div class="stats" id="summary"></div>
       <div class="spacer"></div>
       <div class="actions">
+        <label style="display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;white-space:nowrap">
+          Gleichzeitig
+          <input id="concurrent" type="number" min="1" max="20" value="1" title="Wie viele Browser-Profile gleichzeitig laufen. Empfehlung: 1–3." style="width:56px;height:32px;border:1px solid var(--line);border-radius:7px;padding:0 8px;background:var(--raised);color:var(--ink);font:inherit;color-scheme:dark">
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;white-space:nowrap">
+          Ziel&nbsp;Erfolge
+          <input id="target" type="number" min="0" value="0" title="0 = kein Ziel. Zahl > 0: Wiederholt fehlgeschlagene Zeilen bis dieses Ziel erreicht ist (max. 24 h)." style="width:72px;height:32px;border:1px solid var(--line);border-radius:7px;padding:0 8px;background:var(--raised);color:var(--ink);font:inherit;color-scheme:dark">
+        </label>
         <button type="button" class="btn quiet" id="clear">Clear</button>
         <button type="button" class="btn" id="import-file">Import</button>
         <button type="button" class="btn primary" id="start-selected">Start selected</button>
@@ -1322,6 +1397,16 @@ function renderQueue() {
     .filter((key) => counts[key])
     .map((key) => `<span><b>${counts[key]}</b> ${esc(STATUS_LABEL[key] || key)}</span>`);
   if (latest.reuse_numbers) bits.push(`<span><b>${Number(latest.live_count) || 0}</b> live</span>`);
+  const target = Number(latest.target_success) || 0;
+  if (target > 0) {
+    const done = Number(latest.done_count) || 0;
+    const tl = Number(latest.time_left) || 0;
+    const h = Math.floor(tl / 3600);
+    const m = Math.floor((tl % 3600) / 60);
+    const timeStr = tl > 0 ? `${h}h ${m}m übrig` : "Zeit abgelaufen";
+    bits.push(`<span style="color:#8ee0b2"><b>${done}</b>/${target} Ziel</span>`);
+    bits.push(`<span style="color:#b9ccff">${timeStr}</span>`);
+  }
   document.querySelector("#summary").innerHTML = bits.join("");
   const startable = rows.filter((row) => canStart(row) && selected.has(row.id));
   document.querySelector("#start-selected").disabled = startable.length === 0;
@@ -1368,6 +1453,7 @@ function applyState(payload) {
     if (latest.provider) provider.value = latest.provider;
   }
   if (document.activeElement !== reuse) reuse.checked = !!latest.reuse_numbers;
+  if (document.activeElement !== concurrent) concurrent.value = Number(latest.max_concurrent) || 1;
   renderQueue();
   renderHistory();
 }
@@ -1409,6 +1495,8 @@ async function act(path, body) {
 }
 document.querySelector("#import-file").onclick = () => document.querySelector("#file").click();
 reuse.onchange = () => act("/api/reuse", {enabled: reuse.checked});
+const concurrent = document.querySelector("#concurrent");
+concurrent.onchange = () => act("/api/concurrent", {value: parseInt(concurrent.value, 10) || 1});
 document.querySelector("#file").onchange = async (event) => {
   const file = event.target.files && event.target.files[0];
   event.target.value = "";
@@ -1441,7 +1529,8 @@ document.querySelector("#reload").onclick = async () => {
 document.querySelector("#start-selected").onclick = () => {
   const ids = (latest.rows || []).filter((row) => canStart(row) && selected.has(row.id)).map((row) => row.id);
   ids.forEach((id) => selected.delete(id));
-  act("/api/start", {provider: provider.value, ids});
+  const target = Math.max(0, parseInt(document.querySelector("#target").value, 10) || 0);
+  act("/api/start", {provider: provider.value, ids, target});
 };
 document.querySelector("#pick-all").onchange = (event) => {
   (latest.rows || []).filter(canRemove).forEach((row) => {
@@ -1461,7 +1550,8 @@ queueBody.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-act]");
   if (!button) return;
   if (button.dataset.act === "start") {
-    act("/api/start", {provider: provider.value, ids: [button.dataset.id]});
+    const target = Math.max(0, parseInt(document.querySelector("#target").value, 10) || 0);
+    act("/api/start", {provider: provider.value, ids: [button.dataset.id], target});
     return;
   }
   if (button.dataset.act === "enable") {
@@ -1523,7 +1613,12 @@ class Handler(BaseHTTPRequestHandler):
                 raw_ids = body.get("ids") or []
                 if not isinstance(raw_ids, list):
                     raise ValueError("ids must be a list")
-                self._send(start_rows(str(body.get("provider") or ""), [str(item) for item in raw_ids]), 200)
+                raw_target = body.get("target") or 0
+                try:
+                    target_val = max(0, int(raw_target))
+                except (TypeError, ValueError):
+                    target_val = 0
+                self._send(start_rows(str(body.get("provider") or ""), [str(item) for item in raw_ids], target=target_val), 200)
                 return
             if path == "/api/enable":
                 self._send(enable_pop3(str(body.get("id") or "")), 200)
@@ -1555,6 +1650,16 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("enabled must be true or false")
                 live_numbers.set_enabled(enabled)
                 print(f"Reuse phone number {'on' if enabled else 'off'}", flush=True)
+                self._send(public_state(), 200)
+                return
+            if path == "/api/concurrent":
+                try:
+                    val = max(1, min(20, int(body.get("value") or 1)))
+                except (TypeError, ValueError):
+                    raise ValueError("value must be a number between 1 and 20")
+                with state_lock:
+                    state["max_concurrent"] = val
+                print(f"Max. gleichzeitig: {val}", flush=True)
                 self._send(public_state(), 200)
                 return
             self._send({"ok": False, "error": "not found"}, 404)
