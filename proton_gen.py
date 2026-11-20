@@ -13,6 +13,7 @@ import os
 import random
 import struct
 import sys
+import threading
 import time
 import zlib
 from pathlib import Path
@@ -53,6 +54,20 @@ TARGET_URL2 = os.environ.get("TARGET_URL2", "").strip()
 CAPTCHA_ATTEMPTS = 5
 CAPTCHA_LOAD_TRIES = 3
 SIGNUP_RESTARTS = 3
+_PRINT = print
+_HOOKS = threading.local()
+
+
+def hook_stop() -> None:
+    stop = getattr(_HOOKS, "stop", None)
+    if stop:
+        stop()
+
+
+def note(message: str) -> None:
+    hook_stop()
+    log = getattr(_HOOKS, "log", None) or _PRINT
+    log(message)
 
 
 class SignupRestart(Exception):
@@ -666,7 +681,7 @@ def _abs_rect(found: dict, key: str) -> dict | None:
 def log_captcha(found: dict) -> None:
     buttons = found.get("buttons") or []
     label = ", ".join(str(item) for item in buttons) or "none"
-    print(
+    note(
         f"Captcha found: state={found.get('state')} buttons={label} pictures={found.get('pictures', 0)} "
         f"at ({float(found.get('ox') or 0):.0f}, {float(found.get('oy') or 0):.0f})"
     )
@@ -719,28 +734,28 @@ def solve_canvas(cdp: Cdp, found: dict) -> bool:
         "(() => { const canvas = document.querySelector('canvas'); if (!canvas) return ''; try { return canvas.toDataURL('image/png'); } catch (err) { return ''; } })()",
     )
     if not isinstance(encoded, str) or "," not in encoded:
-        print("Could not read the captcha canvas")
+        note("Could not read the captcha canvas")
         return False
     try:
         bitmap_w, bitmap_h, pixels = decode_png(base64.b64decode(encoded.split(",", 1)[1]))
     except (ValueError, base64.binascii.Error) as exc:
-        print(f"Could not read the captcha canvas: {exc}")
+        note(f"Could not read the captcha canvas: {exc}")
         return False
     piece_box = split_canvas(pixels, bitmap_w, bitmap_h)
     if piece_box is None:
-        print("Could not see the loose puzzle piece on the canvas")
+        note("Could not see the loose puzzle piece on the canvas")
         return False
     piece_x, piece_y, piece_w, piece_h = piece_box
     _pw, _ph, piece_px = crop_rgba(pixels, bitmap_w, bitmap_h, piece_x, piece_y, piece_w, piece_h)
     board_y = piece_h
     _bw, _bh, board_px = crop_rgba(pixels, bitmap_w, bitmap_h, 0, board_y, bitmap_w, bitmap_h - board_y)
     if _pw < 8 or _bw < 8:
-        print("Could not see the loose puzzle piece on the canvas")
+        note("Could not see the loose puzzle piece on the canvas")
         return False
     hole = find_hole(piece_px, _pw, _ph, board_px, _bw, _bh)
     grab = piece_grab(piece_px, _pw, _ph)
     if hole is None or grab is None:
-        print("Could not see where the puzzle piece belongs")
+        note("Could not see where the puzzle piece belongs")
         return False
     scale_x = float(canvas["w"]) / bitmap_w
     scale_y = float(canvas["h"]) / bitmap_h
@@ -750,7 +765,7 @@ def solve_canvas(cdp: Cdp, found: dict) -> bool:
     start_y = origin_y + (piece_y + grab[1]) * scale_y
     end_x = origin_x + hole[0] * scale_x
     end_y = origin_y + (board_y + hole[1]) * scale_y
-    print(f"Dragging the puzzle piece from ({start_x:.0f}, {start_y:.0f}) to ({end_x:.0f}, {end_y:.0f}) (match {hole[2]:.2f})")
+    note(f"Dragging the puzzle piece from ({start_x:.0f}, {start_y:.0f}) to ({end_x:.0f}, {end_y:.0f}) (match {hole[2]:.2f})")
     session_id = frame_session(cdp, "captcha/v1/assets") or None
     shift_x = float(found.get("ox") or 0)
     shift_y = float(found.get("oy") or 0)
@@ -762,7 +777,7 @@ def solve_canvas(cdp: Cdp, found: dict) -> bool:
         mouse_drag(cdp, start_x, start_y, end_x, end_y, None)
         time.sleep(0.45)
         mouse_click_in(cdp, nxt[0], nxt[1], None)
-    print("Clicked Weiter")
+    note("Clicked Weiter")
     return True
 
 
@@ -777,7 +792,7 @@ def solve_puzzle(cdp: Cdp, found: dict) -> bool:
     try:
         width, height, pixels, scale = screenshot(cdp, session_id)
     except (RuntimeError, TimeoutError, ValueError) as exc:
-        print(f"Could not photograph the captcha: {exc}")
+        note(f"Could not photograph the captcha: {exc}")
         return False
 
     def region(rect: dict) -> tuple[int, int, bytes]:
@@ -794,23 +809,23 @@ def solve_puzzle(cdp: Cdp, found: dict) -> bool:
     piece_w, piece_h, piece_px = region(piece)
     board_w, board_h, board_px = region(board)
     if piece_w < 8 or board_w < 8:
-        print("Captcha picture was outside the window")
+        note("Captcha picture was outside the window")
         return False
     hole = find_hole(piece_px, piece_w, piece_h, board_px, board_w, board_h)
     grab = piece_grab(piece_px, piece_w, piece_h)
     if hole is None or grab is None:
-        print("Could not see where the puzzle piece belongs")
+        note("Could not see where the puzzle piece belongs")
         return False
     hole_x, hole_y, score = hole
     start_x = piece["x"] + grab[0] / piece_w * piece["w"]
     start_y = piece["y"] + grab[1] / piece_h * piece["h"]
     end_x = board["x"] + hole_x / board_w * board["w"]
     end_y = board["y"] + hole_y / board_h * board["h"]
-    print(f"Dragging the puzzle piece from ({start_x:.0f}, {start_y:.0f}) to ({end_x:.0f}, {end_y:.0f}) (match {score:.2f})")
+    note(f"Dragging the puzzle piece from ({start_x:.0f}, {start_y:.0f}) to ({end_x:.0f}, {end_y:.0f}) (match {score:.2f})")
     mouse_drag(cdp, start_x, start_y, end_x, end_y, session_id)
     time.sleep(0.45)
     mouse_click_in(cdp, nxt[0], nxt[1], session_id)
-    print("Clicked Weiter")
+    note("Clicked Weiter")
     return True
 
 
@@ -835,10 +850,10 @@ def open_captcha(cdp: Cdp) -> None:
     for attempt in range(1, CAPTCHA_LOAD_TRIES + 1):
         stop_if_username_taken(cdp)
         if abuse_blocked(cdp):
-            print("Proton blocked further signups on this network.")
+            note("Proton blocked further signups on this network.")
         if not captcha_ready(cdp):
             press_enter(cdp)
-            print("Pressed Enter")
+            note("Pressed Enter")
             click_deadline = time.time() + 3
             while time.time() < click_deadline and not captcha_ready(cdp):
                 if click_create_account(cdp):
@@ -849,15 +864,15 @@ def open_captcha(cdp: Cdp) -> None:
             stop_if_username_taken(cdp)
             found = locate_captcha(cdp)
             if found:
-                print("Captcha loaded")
+                note("Captcha loaded")
                 log_captcha(found)
                 return
             time.sleep(0.4)
         if attempt == CAPTCHA_LOAD_TRIES:
-            print("Captcha did not load after 3 tries. Restarting on a new proxy.")
+            note("Captcha did not load after 3 tries. Restarting on a new proxy.")
             raise SignupRestart()
         pause = random.uniform(5, 7)
-        print(f"Captcha did not load. Waiting {pause:.1f}s and trying again ({attempt}/3)")
+        note(f"Captcha did not load. Waiting {pause:.1f}s and trying again ({attempt}/3)")
         time.sleep(pause)
 
 
@@ -875,18 +890,18 @@ def captcha_passed(cdp: Cdp) -> bool:
 
 
 def solve_captcha(cdp: Cdp) -> None:
-    print("Looking for the captcha")
+    note("Looking for the captcha")
     announced = False
     deadline = time.time() + 50
     while time.time() < deadline and not locate_captcha(cdp):
         stop_if_username_taken(cdp)
         if captcha_passed(cdp):
-            print("Captcha already complete")
+            note("Captcha already complete")
             return
         time.sleep(0.4)
     for attempt in range(1, CAPTCHA_ATTEMPTS + 1):
         if captcha_passed(cdp):
-            print("Captcha complete")
+            note("Captcha complete")
             return
         found = None
         until = time.time() + 25
@@ -899,7 +914,7 @@ def solve_captcha(cdp: Cdp) -> None:
                 time.sleep(0.4)
                 continue
             if captcha_passed(cdp):
-                print("Captcha complete")
+                note("Captcha complete")
                 return
             time.sleep(0.4)
         if not found:
@@ -910,14 +925,14 @@ def solve_captcha(cdp: Cdp) -> None:
         if found.get("state") == "retry":
             point = _abs_point(found, "retry")
             if point:
-                print(f"Captcha failed. Clicking Retry ({attempt}/{CAPTCHA_ATTEMPTS})")
+                note(f"Captcha failed. Clicking Retry ({attempt}/{CAPTCHA_ATTEMPTS})")
                 mouse_click_in(cdp, point[0], point[1], str(found.get("session_id") or "") or None)
                 time.sleep(1.2)
                 continue
         log_captcha(found)
-        print(f"Solving captcha ({attempt}/{CAPTCHA_ATTEMPTS})")
+        note(f"Solving captcha ({attempt}/{CAPTCHA_ATTEMPTS})")
         if not announced:
-            print("Captcha puzzle is open")
+            note("Captcha puzzle is open")
             announced = True
         solved = solve_canvas(cdp, found) if found.get("state") == "canvas" else solve_puzzle(cdp, found)
         if not solved:
@@ -929,13 +944,13 @@ def solve_captcha(cdp: Cdp) -> None:
         after = time.time() + 12
         while time.time() < after:
             if captcha_passed(cdp):
-                print("Captcha complete")
+                note("Captcha complete")
                 return
             failed = locate_captcha(cdp)
             if isinstance(failed, dict) and failed.get("state") == "retry":
                 point = _abs_point(failed, "retry")
                 if point:
-                    print(f"Captcha failed. Clicking Retry ({attempt}/{CAPTCHA_ATTEMPTS})")
+                    note(f"Captcha failed. Clicking Retry ({attempt}/{CAPTCHA_ATTEMPTS})")
                     mouse_click_in(cdp, point[0], point[1], str(failed.get("session_id") or "") or None)
                     time.sleep(1.2)
                 break
@@ -975,7 +990,7 @@ def click_free_plan(cdp: Cdp) -> None:
             if isinstance(info, dict):
                 if str(info.get("pressed")).lower() == "true":
                     clear_selection(cdp)
-                    print("Selected Free")
+                    note("Selected Free")
                     return
                 if info.get("inside"):
                     mouse_click(cdp, float(info["x"]), float(info["y"]))
@@ -986,13 +1001,13 @@ def click_free_plan(cdp: Cdp) -> None:
         if attempt == 3:
             raise SystemExit("Could not find the Free plan")
         pause = random.uniform(8, 12)
-        print(f"Free plan is not on the page yet. Waiting {pause:.1f}s and opening it again ({attempt}/3)")
+        note(f"Free plan is not on the page yet. Waiting {pause:.1f}s and opening it again ({attempt}/3)")
         widen_signup_window(cdp, "", _PROFILE_ID)
         time.sleep(pause)
         try:
             cdp.call("Page.reload", {"ignoreCache": True}, timeout=30)
         except (RuntimeError, TimeoutError) as exc:
-            print(f"Could not reload the signup page: {exc}")
+            note(f"Could not reload the signup page: {exc}")
         time.sleep(random.uniform(2, 4))
 
 
@@ -1013,7 +1028,7 @@ def username_taken(cdp: Cdp) -> bool:
 
 def stop_if_username_taken(cdp: Cdp) -> None:
     if username_taken(cdp):
-        print("Benutzername wird bereits verwendet. Stopped.")
+        note("Benutzername wird bereits verwendet. Stopped.")
         raise SystemExit("Benutzername wird bereits verwendet.")
 
 
@@ -1129,7 +1144,65 @@ def main_field_point(cdp: Cdp, selector: str) -> dict | None:
     return {"x": float(point["x"]), "y": float(point["y"]), "frame_id": ""}
 
 
+def reveal_username(cdp: Cdp) -> str:
+    """Bring the username box into view. The Free plan click leaves it below the window."""
+    state = evaluate(
+        cdp,
+        "(() => {"
+        " const roots = [];"
+        " const visit = (node) => {"
+        "  if (!node || !node.querySelectorAll) return;"
+        "  roots.push(node);"
+        "  for (const el of node.querySelectorAll('*')) if (el.shadowRoot) visit(el.shadowRoot);"
+        " };"
+        " visit(document);"
+        " const hidden = (el) => !!(el.closest && el.closest('[aria-hidden=\"true\"], .visibility-hidden'));"
+        " let target = null;"
+        " for (const root of roots) {"
+        "  target = [...root.querySelectorAll('iframe')].find((el) => /name=email/i.test((el.src || '') + ' ' + (el.name || '') + ' ' + (el.title || '') + ' ' + (el.id || '')));"
+        "  if (target) break;"
+        " }"
+        " if (!target) {"
+        "  for (const root of roots) {"
+        "   target = [...root.querySelectorAll('#username')].find((el) => {"
+        "    if (hidden(el)) return false;"
+        "    const r = el.getBoundingClientRect();"
+        "    return r.width > 2 && r.height > 2;"
+        "   });"
+        "   if (target) break;"
+        "  }"
+        " }"
+        " const scroller = document.scrollingElement || document.documentElement;"
+        " if (!target) {"
+        "  const before = scroller.scrollTop;"
+        "  scroller.scrollBy(0, Math.round((window.innerHeight || 800) * 0.7));"
+        "  return scroller.scrollTop > before + 2 ? 'down' : '';"
+        " }"
+        " target.scrollIntoView({block: 'center', inline: 'nearest'});"
+        " let parent = target.parentElement;"
+        " while (parent) {"
+        "  const style = getComputedStyle(parent);"
+        "  if (/(auto|scroll)/.test(style.overflowY) && parent.scrollHeight > parent.clientHeight + 8) {"
+        "   const r = target.getBoundingClientRect();"
+        "   const box = parent.getBoundingClientRect();"
+        "   if (r.top < box.top + 12 || r.bottom > box.bottom - 12) parent.scrollTop += r.top - (box.top + box.height / 2);"
+        "  }"
+        "  parent = parent.parentElement;"
+        " }"
+        " let r = target.getBoundingClientRect();"
+        " if (r.top > window.innerHeight - 48 || r.bottom < 48) {"
+        "  scroller.scrollBy(0, r.top - window.innerHeight / 2);"
+        "  r = target.getBoundingClientRect();"
+        " }"
+        " const seen = r.width > 2 && r.height > 2 && r.bottom > 0 && r.top < window.innerHeight && r.left < window.innerWidth && r.right > 0;"
+        " return seen ? 'ready' : 'moved';"
+        "})()",
+    )
+    return str(state or "")
+
+
 def email_challenge_point(cdp: Cdp) -> dict | None:
+    reveal_username(cdp)
     frame_id = ""
     for frame in child_frames(cdp):
         url = str(frame.get("url") or "")
@@ -1142,10 +1215,23 @@ def email_challenge_point(cdp: Cdp) -> dict | None:
     origin = evaluate(
         cdp,
         "(() => {"
-        " const frame = [...document.querySelectorAll('iframe')].find((el) => /name=email/i.test(el.src || ''));"
+        " const roots = [];"
+        " const visit = (node) => {"
+        "  if (!node || !node.querySelectorAll) return;"
+        "  roots.push(node);"
+        "  for (const el of node.querySelectorAll('*')) if (el.shadowRoot) visit(el.shadowRoot);"
+        " };"
+        " visit(document);"
+        " let frame = null;"
+        " for (const root of roots) {"
+        "  frame = [...root.querySelectorAll('iframe')].find((el) => /name=email/i.test(el.src || ''));"
+        "  if (frame) break;"
+        " }"
         " if (!frame) return null;"
+        " frame.scrollIntoView({block: 'center', inline: 'nearest'});"
         " const r = frame.getBoundingClientRect();"
-        " if (r.width < 2 || r.height < 2 || r.left < -10 || r.top < -10) return null;"
+        " if (r.width < 2 || r.height < 2) return null;"
+        " if (r.bottom < 0 || r.top >= window.innerHeight || r.right < 0 || r.left >= window.innerWidth) return null;"
         " return {left: r.left, top: r.top};"
         "})()",
     )
@@ -1259,7 +1345,14 @@ def field_state(cdp: Cdp, selector: str, frame_id: str, session_id: str = "") ->
 
 def focus_field(cdp: Cdp, selector: str) -> dict:
     deadline = time.time() + 20
+    announced = False
     while time.time() < deadline:
+        if selector == "#username":
+            state = reveal_username(cdp)
+            if state in {"down", "moved"} and not announced:
+                note("Scrolling to the username field")
+                announced = True
+                time.sleep(0.4)
         session_id = frame_session(cdp, "name=email") if selector == "#username" else ""
         target = field_target(cdp, selector)
         if target:
@@ -1312,9 +1405,14 @@ def fill_input(cdp: Cdp, selector: str, text: str) -> None:
 
 def wait_for_username(cdp: Cdp) -> None:
     deadline = time.time() + 25
+    announced = False
     while time.time() < deadline:
-        if evaluate(cdp, "!!document.querySelector('#username')"):
+        state = reveal_username(cdp)
+        if state == "ready" or email_challenge_point(cdp):
             return
+        if state in {"down", "moved"} and not announced:
+            note("Scrolling to the username field")
+            announced = True
         time.sleep(0.4)
     raise SystemExit("Could not find the username field")
 
@@ -1329,7 +1427,7 @@ def enter_username(cdp: Cdp, username: str) -> None:
     while time.time() < deadline:
         stop_if_username_taken(cdp)
         time.sleep(0.4)
-    print(f"Entered username {username}")
+    note(f"Entered username {username}")
 
 
 def enter_password(cdp: Cdp, password: str) -> None:
@@ -1347,7 +1445,7 @@ def enter_password(cdp: Cdp, password: str) -> None:
     if evaluate(cdp, "!!document.querySelector('#password-confirm')"):
         fill_input(cdp, "#password-confirm", password)
     else:
-        print("No confirm-password field on this form")
+        note("No confirm-password field on this form")
     clear_selection(cdp)
     open_captcha(cdp)
 
@@ -1373,7 +1471,7 @@ def click_labeled_button(cdp: Cdp, pattern: str) -> bool:
     )
     if not clicked:
         return False
-    print(f"Clicked {clicked}")
+    note(f"Clicked {clicked}")
     return True
 
 
@@ -1398,7 +1496,7 @@ def click_create_account(cdp: Cdp) -> bool:
         return False
     mouse_click(cdp, float(box["x"]), float(box["y"]))
     clear_selection(cdp)
-    print(f"Clicked {box.get('label') or 'create account'}")
+    note(f"Clicked {box.get('label') or 'create account'}")
     return True
 
 
@@ -1423,7 +1521,7 @@ def click_continue(cdp: Cdp) -> bool:
         return False
     mouse_click(cdp, float(box["x"]), float(box["y"]))
     clear_selection(cdp)
-    print(f"Clicked {box.get('label') or 'continue'}")
+    note(f"Clicked {box.get('label') or 'continue'}")
     return True
 
 
@@ -1448,10 +1546,10 @@ def accept_recovery_notice(cdp: Cdp) -> None:
         )
         if isinstance(checked, dict) and not checked.get("checked"):
             mouse_click(cdp, float(checked["x"]), float(checked["y"]))
-            print("Checked the recovery notice")
+            note("Checked the recovery notice")
             time.sleep(0.3)
         elif isinstance(checked, dict):
-            print("Checked the recovery notice")
+            note("Checked the recovery notice")
         if evaluate(cdp, "!!(document.querySelector('#understood-recovery-necessity') && document.querySelector('#understood-recovery-necessity').checked)"):
             if click_continue(cdp):
                 time.sleep(1)
@@ -1466,7 +1564,7 @@ def enter_display_name(cdp: Cdp, display_name: str) -> None:
     if not evaluate(cdp, "!!document.querySelector('#displayName')"):
         raise SystemExit("Could not find the display name field")
     fill_input(cdp, "#displayName", display_name)
-    print(f"Entered display name {display_name}")
+    note(f"Entered display name {display_name}")
     deadline = time.time() + 20
     last_click = 0.0
     while time.time() < deadline:
@@ -1483,7 +1581,7 @@ def enter_display_name(cdp: Cdp, display_name: str) -> None:
         if time.time() - last_click > 1.5:
             if not click_continue(cdp):
                 press_enter(cdp)
-                print("Pressed Enter")
+                note("Pressed Enter")
             last_click = time.time()
         time.sleep(0.4)
     raise SystemExit("Display name was not accepted")
@@ -1513,7 +1611,7 @@ def save_proton_account(email: str, password: str) -> None:
                 backup = park_broken(ACCOUNTS_FILE)
                 if backup is None:
                     raise SystemExit(f"Could not read {ACCOUNTS_FILE.name}, so the new mailbox was not written over it") from exc
-                print(f"Could not read saved mailboxes. Kept the old file as {backup.name}.")
+                note(f"Could not read saved mailboxes. Kept the old file as {backup.name}.")
                 raw = []
             if isinstance(raw, dict):
                 raw = [raw]
@@ -1530,7 +1628,7 @@ def save_proton_account(email: str, password: str) -> None:
         if not replaced:
             accounts.append({"email": email, "password": password})
         write_text_atomic(ACCOUNTS_FILE, json.dumps(accounts, indent=2))
-    print(f"Saved {email} to {ACCOUNTS_FILE.name}")
+    note(f"Saved {email} to {ACCOUNTS_FILE.name}")
 
 
 def fill_proton(cdp: Cdp, username: str, password: str, display_name: str) -> str:
@@ -1545,7 +1643,7 @@ def fill_proton(cdp: Cdp, username: str, password: str, display_name: str) -> st
     email = chosen_email(cdp, username)
     if email.lower() != f"{username}@proton.me".lower():
         save_proton_account(email, password)
-    print(f"Proton mailbox ready: {email}")
+    note(f"Proton mailbox ready: {email}")
     return email
 
 
@@ -1585,12 +1683,12 @@ def replace_proxy(
 ) -> dict:
     proxy = another_proxy(proxies_path, current)
     resolved = resolve_proxy_type(session, proxy, proxy_type, skip_check)
-    print(f"Updating proxy to {proxy_label(proxy, resolved)}")
+    note(f"Updating proxy to {proxy_label(proxy, resolved)}")
     payload = api.edit_profile(profile_id, {"proxy": proxy_body(proxy, resolved)})
     if isinstance(payload, dict) and payload.get("success") is False:
         message = payload.get("error") or payload.get("message") or payload
         raise RuntimeError(f"Dolphin did not update the proxy: {message}")
-    print("Updated the proxy")
+    note("Updated the proxy")
     return proxy
 
 
@@ -1733,9 +1831,9 @@ def widen_signup_window(cdp: Cdp, target_id: str, profile_id: str) -> None:
                 "Browser.setWindowBounds",
                 {"windowId": window_id, "bounds": {"windowState": "maximized"}},
             )
-        print("Opened the browser at full width")
+        note("Opened the browser at full width")
     except (RuntimeError, TimeoutError, OSError) as exc:
-        print(f"Could not maximize the browser: {exc}")
+        note(f"Could not maximize the browser: {exc}")
 
 
 def open_browser(
@@ -1748,17 +1846,107 @@ def open_browser(
     _PROFILE_ID = profile_id
     automation = start_profile(session, profile_id, headless)
     port = int(automation["port"])
-    print(f"Started {profile} on port {port}")
+    note(f"Started {profile} on port {port}")
     ws, target_id = connect_page(port)
     cdp = Cdp(ws)
     if target_id:
         try:
             cdp.call("Target.activateTarget", {"targetId": target_id})
         except (RuntimeError, TimeoutError) as exc:
-            print(f"Could not focus the tab: {exc}")
+            note(f"Could not focus the tab: {exc}")
     if not headless:
         widen_signup_window(cdp, target_id, profile_id)
     return ws, cdp, target_id
+
+
+def generate_mailbox(
+    profile: str,
+    email: str,
+    password: str,
+    display_name: str = "",
+    log=None,
+    stop=None,
+    proxies: Path | None = None,
+    proxy_type: str = "http",
+    headless: bool = False,
+    skip_check: bool = True,
+    url: str = "",
+) -> str:
+    """Open Proton signup for this address. No SMS step. Returns the created address."""
+    previous_log = getattr(_HOOKS, "log", None)
+    previous_stop = getattr(_HOOKS, "stop", None)
+    if log is not None:
+        _HOOKS.log = log
+    if stop is not None:
+        _HOOKS.stop = stop
+    try:
+        return _run_signup(profile, email, password, display_name, proxies, proxy_type, headless, skip_check, url)
+    finally:
+        _HOOKS.log = previous_log
+        _HOOKS.stop = previous_stop
+
+
+def _run_signup(
+    profile: str,
+    email: str,
+    password: str,
+    display_name: str,
+    proxies: Path | None,
+    proxy_type: str,
+    headless: bool,
+    skip_check: bool,
+    url: str,
+) -> str:
+    profile = normalize_profile_name(profile)
+    username = normalize_username(email)
+    password = (password or "").strip()
+    if not password:
+        raise SystemExit("Missing password")
+    display_name = (display_name or "").strip() or username
+    page = signup_url(url)
+    proxy_path = proxies or (ROOT / "proxies.txt")
+    proxy = load_random_proxy(proxy_path)
+    session = requests.Session()
+    local_login(session)
+    resolved = resolve_proxy_type(session, proxy, proxy_type, skip_check)
+    note(f"Using {proxy_label(proxy, resolved)}")
+
+    api = DolphinAPI(collect_garbage_on_init=False)
+    profile_id = create_profile(api, profile, proxy, resolved)
+    ws: CdpSocket | None = None
+    cdp: Cdp | None = None
+    try:
+        ws, cdp, _target_id = open_browser(session, profile_id, profile, headless)
+        navigate(cdp, page)
+        created = ""
+        for restart in range(SIGNUP_RESTARTS):
+            try:
+                created = fill_proton(cdp, username, password, display_name)
+                break
+            except SignupRestart:
+                if restart == SIGNUP_RESTARTS - 1:
+                    raise SystemExit("Captcha did not load. Stopped after 3 restarts.")
+                note(f"Restarting signup ({restart + 2}/{SIGNUP_RESTARTS})")
+                try:
+                    ws.close()
+                except OSError:
+                    pass
+                ws = None
+                stop_profile(session, profile_id)
+                time.sleep(1)
+                proxy = replace_proxy(session, api, profile_id, proxy_path, proxy_type, skip_check, proxy)
+                ws, cdp, _target_id = open_browser(session, profile_id, profile, headless)
+                navigate(cdp, page)
+        if not created:
+            raise SystemExit("Proton signup did not finish")
+    except BaseException:
+        try:
+            finish_profile(session, api, profile_id, cdp, ws)
+        except Exception as exc:
+            _PRINT(f"Could not close the browser: {exc}")
+        raise
+    finish_profile(session, api, profile_id, cdp, ws)
+    return created
 
 
 def main() -> None:
@@ -1782,58 +1970,17 @@ def main() -> None:
     username = normalize_username(ask(args.username or args.profile, "Username"))
     password = ask(args.password, "Password")
     display_name = (args.display_name or "").strip() or username
-    url = signup_url(args.url)
-
-    proxy = load_random_proxy(Path(args.proxies))
-    session = requests.Session()
-    local_login(session)
-    proxy_type = resolve_proxy_type(session, proxy, args.proxy_type, args.skip_check)
-    print(f"Using {proxy_label(proxy, proxy_type)}")
-
-    api = DolphinAPI(collect_garbage_on_init=False)
-    profile_id = create_profile(api, profile, proxy, proxy_type)
-    ws: CdpSocket | None = None
-    cdp: Cdp | None = None
-    try:
-        ws, cdp, _target_id = open_browser(session, profile_id, profile, args.headless)
-        navigate(cdp, url)
-        for restart in range(SIGNUP_RESTARTS):
-            try:
-                fill_proton(cdp, username, password, display_name)
-                break
-            except SignupRestart:
-                if restart == SIGNUP_RESTARTS - 1:
-                    raise SystemExit("Captcha did not load. Stopped after 3 restarts.")
-                print(f"Restarting signup ({restart + 2}/{SIGNUP_RESTARTS})")
-                _CAPTCHA_SESSIONS.clear()
-                _FRAME_SESSIONS.clear()
-                try:
-                    ws.close()
-                except OSError:
-                    pass
-                ws = None
-                stop_profile(session, profile_id)
-                time.sleep(1)
-                proxy = replace_proxy(
-                    session,
-                    api,
-                    profile_id,
-                    Path(args.proxies),
-                    args.proxy_type,
-                    args.skip_check,
-                    proxy,
-                )
-                ws, cdp, _target_id = open_browser(session, profile_id, profile, args.headless)
-                navigate(cdp, url)
-    except BaseException:
-        if ws is not None:
-            try:
-                ws.close()
-            except OSError:
-                pass
-        print("Browser left open.")
-        raise
-    finish_profile(session, api, profile_id, cdp, ws)
+    generate_mailbox(
+        profile,
+        f"{username}@proton.me",
+        password,
+        display_name,
+        proxies=Path(args.proxies),
+        proxy_type=args.proxy_type,
+        headless=args.headless,
+        skip_check=args.skip_check,
+        url=args.url,
+    )
 
 
 if __name__ == "__main__":

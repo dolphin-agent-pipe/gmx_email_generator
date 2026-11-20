@@ -14,8 +14,15 @@ Each imported line is split on semicolons:
     email;first;last;day;month;year;plz;city;street;password
     email;first;last;day;month;year;plz;city;street;password;country
 
-The email domain chooses GMX or WEB.DE. If that address is taken,
-signup uses the provider suggestion and marks the row as suggested.
+The email domain chooses the signup. GMX and WEB.DE order an SMS number.
+A Proton address (proton.me, protonmail.com, or pm.me) uses proton_gen.py
+and does not order a number. Proton rows only need the address and password:
+
+    name@proton.me;password
+    name@proton.me;First;Last;password
+
+If a GMX or WEB.DE address is taken, signup uses the provider suggestion
+and marks the row as suggested.
 """
 
 from __future__ import annotations
@@ -77,7 +84,7 @@ PROVIDERS = {
 }
 COLUMNS = ("email", "first", "last", "day", "month", "year", "plz", "city", "street", "password")
 EMAIL_RE = re.compile(
-    r"^[A-Za-z0-9._%+-]+@(?:web\.de|gmx\.net|gmx\.de|gmx\.com|gmx\.at|gmx\.ch)$",
+    r"^[A-Za-z0-9._%+-]+@(?:web\.de|gmx\.net|gmx\.de|gmx\.com|gmx\.at|gmx\.ch|proton\.me|protonmail\.com|pm\.me)$",
     re.IGNORECASE,
 )
 
@@ -230,13 +237,12 @@ def person_name(row: dict) -> str:
     return f"{str(row.get('first') or '').strip()} {str(row.get('last') or '').strip()}".strip()
 
 
+def kind_label(kind: str) -> str:
+    return {"webde": "WEB.DE", "gmx": "GMX", "proton": "Proton"}.get(kind, kind)
+
+
 def history_kind(row: dict) -> str:
-    kind = str(row.get("kind") or "")
-    if kind == "webde":
-        return "WEB.DE"
-    if kind == "gmx":
-        return "GMX"
-    return kind
+    return kind_label(str(row.get("kind") or ""))
 
 
 def history_provider(row: dict) -> str:
@@ -368,12 +374,22 @@ def parse_rows(text: str) -> list[dict]:
             continue
         row = {key: "" for key in COLUMNS}
         row["country"] = "DE"
-        for key, value in zip(COLUMNS, parts):
-            row[key] = value
-        if len(parts) >= 11 and parts[10]:
-            row["country"] = parts[10].upper()
-        email = str(row.get("email") or "").strip()
+        email = parts[0].strip() if parts else ""
         kind = kind_from_email(email)
+        if kind == "proton" and 1 < len(parts) < len(COLUMNS):
+            row["email"] = email
+            row["password"] = parts[-1]
+            if len(parts) >= 3:
+                row["first"] = parts[1]
+            if len(parts) >= 4:
+                row["last"] = parts[2]
+        else:
+            for key, value in zip(COLUMNS, parts):
+                row[key] = value
+            if len(parts) >= 11 and parts[10]:
+                row["country"] = parts[10].upper()
+            email = str(row.get("email") or "").strip()
+            kind = kind_from_email(email)
         row.update(
             {
                 "id": uuid.uuid4().hex[:12],
@@ -388,13 +404,21 @@ def parse_rows(text: str) -> list[dict]:
                 "kind": kind,
             }
         )
-        missing = [key for key in COLUMNS if not row[key]]
-        if missing:
-            row["status"] = "failed"
-            row["detail"] = "Missing " + ", ".join(missing)
-        elif not EMAIL_RE.match(email) or not kind:
-            row["status"] = "failed"
-            row["detail"] = "Email must be a GMX or WEB.DE address"
+        if kind == "proton":
+            if not EMAIL_RE.match(email):
+                row["status"] = "failed"
+                row["detail"] = "Email must be a Proton address"
+            elif not str(row.get("password") or "").strip():
+                row["status"] = "failed"
+                row["detail"] = "Missing password"
+        else:
+            missing = [key for key in COLUMNS if not row[key]]
+            if missing:
+                row["status"] = "failed"
+                row["detail"] = "Missing " + ", ".join(missing)
+            elif not EMAIL_RE.match(email) or not kind:
+                row["status"] = "failed"
+                row["detail"] = "Email must be a GMX, WEB.DE, or Proton address"
         rows.append(row)
     return rows
 
@@ -446,6 +470,8 @@ def kind_from_email(email: str) -> str:
         return "webde"
     if re.search(r"@gmx\.(net|de|com|at|ch)$", addr):
         return "gmx"
+    if re.search(r"@(?:proton\.me|protonmail\.com|pm\.me)$", addr):
+        return "proton"
     return ""
 
 
@@ -455,7 +481,12 @@ def service_email(row: dict, kind: str) -> str:
         return wanted
     local = re.sub(r"[^a-z0-9]+", ".", f"{row['first']}.{row['last']}".lower()).strip(".")
     local = local[:40] or row["id"]
-    domain = "web.de" if kind == "webde" else "gmx.net"
+    if kind == "proton":
+        domain = "proton.me"
+    elif kind == "webde":
+        domain = "web.de"
+    else:
+        domain = "gmx.net"
     return f"{local}@{domain}"
 
 
@@ -534,15 +565,128 @@ def set_detail_by_email(email: str, detail: str) -> None:
         save_store()
 
 
+def proton_display_name(row: dict, username: str) -> str:
+    parts = [str(row.get("first") or "").strip(), str(row.get("last") or "").strip()]
+    return " ".join(part for part in parts if part) or username
+
+
+def run_proton_row(row: dict) -> None:
+    from proton_gen import generate_mailbox, normalize_username
+
+    desired = str(row.get("requested_email") or row.get("email") or "").strip()
+    password = str(row.get("password") or "")
+    try:
+        username = normalize_username(desired)
+    except SystemExit as exc:
+        message = str(getattr(exc, "code", "") or exc).strip() or "Username is missing"
+        with state_lock:
+            row["status"] = "failed"
+            row["kind"] = "proton"
+            row["detail"] = message[:300]
+            save_store()
+        console(row, row["detail"])
+        return
+    if not password.strip():
+        with state_lock:
+            row["status"] = "failed"
+            row["kind"] = "proton"
+            row["detail"] = "Missing password"
+            save_store()
+        console(row, row["detail"])
+        return
+    profile = re.sub(r"[^A-Za-z0-9._-]+", "-", username).strip("-") or row["id"]
+    with state_lock:
+        row["status"] = "running"
+        row["provider"] = ""
+        row["kind"] = "proton"
+        row["task"] = ""
+        row["requested_email"] = desired
+        row["email"] = desired
+        row["suggested"] = False
+        row["service_email"] = desired
+        row["detail"] = "Creating the Proton mailbox"
+        save_store()
+    console(row, "Creating the Proton mailbox")
+
+    def log(message: str) -> None:
+        ensure_active(row)
+        set_detail(row, message)
+
+    try:
+        email = generate_mailbox(
+            profile,
+            desired,
+            password,
+            proton_display_name(row, username),
+            log=log,
+            stop=lambda: ensure_active(row),
+        )
+        created = now_stamp()
+        with state_lock:
+            row["status"] = "done"
+            row["email"] = email
+            row["requested_email"] = desired
+            row["suggested"] = False
+            row["phone"] = ""
+            row["created_at"] = created
+            row["detail"] = "Mailbox created"
+            state["history"].insert(
+                0,
+                {
+                    "id": row["id"],
+                    "created_at": created,
+                    "email": email,
+                    "password": password,
+                    "provider": "Proton",
+                    "kind": "Proton",
+                    "name": person_name(row) or username,
+                    "phone": "",
+                    "suggested": False,
+                    "requested_email": desired,
+                },
+            )
+            save_store()
+        console(row, f"Mailbox created: {email}")
+    except RowCancelled:
+        console(row, "Cancelled")
+        with state_lock:
+            row["status"] = "ready"
+            row["cancel"] = False
+            row["detail"] = "Cancelled"
+            save_store()
+    except (SystemExit, OSError, TimeoutError, RuntimeError, ValueError) as exc:
+        message = str(getattr(exc, "code", "") or exc).strip() or "Generation failed"
+        if password:
+            message = message.replace(password, "***")
+        with state_lock:
+            row["status"] = "failed"
+            row["cancel"] = False
+            row["detail"] = message[:300]
+            save_store()
+        console(row, row["detail"])
+    except Exception as exc:
+        traceback.print_exc()
+        message = str(exc).replace(password, "***") if password else str(exc)
+        with state_lock:
+            row["status"] = "failed"
+            row["cancel"] = False
+            row["detail"] = message[:300] or "Generation failed"
+            save_store()
+        console(row, row["detail"])
+
+
 def run_row(row: dict, provider: str, kind: str) -> None:
     from gmx_gen import MailboxSettingsError, NoPhonesLeft, SignupRestart, generate_mailbox, mailbox_address
 
     desired = str(row.get("requested_email") or row.get("email") or "").strip()
     kind = kind_from_email(desired) or str(kind or "").strip()
+    if kind == "proton":
+        run_proton_row(row)
+        return
     if not EMAIL_RE.match(desired) or kind not in {"gmx", "webde"}:
         with state_lock:
             row["status"] = "failed"
-            row["detail"] = "Email must be a GMX or WEB.DE address"
+            row["detail"] = "Email must be a GMX, WEB.DE, or Proton address"
             save_store()
         console(row, row["detail"])
         return
@@ -557,7 +701,7 @@ def run_row(row: dict, provider: str, kind: str) -> None:
         row["service_email"] = email_key
         row["detail"] = "Ordering numbers"
         save_store()
-    console(row, f"Ordering numbers for {'WEB.DE' if kind == 'webde' else 'GMX'}")
+    console(row, f"Ordering numbers for {kind_label(kind)}")
     ordered = False
     try:
         price_index = 0
@@ -707,7 +851,7 @@ def run_row(row: dict, provider: str, kind: str) -> None:
                     "email": mailbox,
                     "password": row["password"],
                     "provider": PROVIDERS[provider]["label"],
-                    "kind": "WEB.DE" if kind == "webde" else "GMX",
+                    "kind": kind_label(kind),
                     "name": f"{row['first']} {row['last']}",
                     "phone": row["phone"],
                     "suggested": bool(suggested),
@@ -950,7 +1094,16 @@ def start_rows(provider: str, ids: list[str], target: int = 0) -> dict:
     wanted = {str(item) for item in ids if str(item).strip()}
     if not wanted:
         raise RuntimeError("Select at least one row")
-    if not provider_up(provider):
+    with state_lock:
+        chosen = [
+            row for row in state["rows"]
+            if row.get("id") in wanted and row.get("status") in {"ready", "failed"}
+        ]
+        needs_sms = any(
+            kind_from_email(str(row.get("requested_email") or row.get("email") or "")) in {"gmx", "webde"}
+            for row in chosen
+        )
+    if needs_sms and not provider_up(provider):
         label = PROVIDERS[provider]["label"]
         base = PROVIDERS[provider]["base"]
         raise RuntimeError(f"{label} is not running at {base}")
@@ -963,18 +1116,21 @@ def start_rows(provider: str, ids: list[str], target: int = 0) -> dict:
             kind = kind_from_email(email)
             if not kind:
                 row["status"] = "failed"
-                row["detail"] = "Email must be a GMX or WEB.DE address"
+                row["detail"] = "Email must be a GMX, WEB.DE, or Proton address"
                 continue
             row["status"] = "queued"
             row["task"] = ""
             row["cancel"] = False
-            row["provider"] = provider
+            row["provider"] = "" if kind == "proton" else provider
             row["kind"] = kind
             row["requested_email"] = email
             row["suggested"] = False
             row["detail"] = "Waiting"
             queued += 1
-            console(row, f"Queued on {PROVIDERS[provider]['label']} ({'WEB.DE' if kind == 'webde' else 'GMX'})")
+            if kind == "proton":
+                console(row, "Queued Proton signup")
+            else:
+                console(row, f"Queued on {PROVIDERS[provider]['label']} ({kind_label(kind)})")
         if not queued:
             raise RuntimeError("Select a row that is waiting or failed")
         state["running"] = True
@@ -1230,7 +1386,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="brand">
     <span class="mark"></span>
     <h1>Mailbox</h1>
-    <span>GMX · WEB.DE</span>
+    <span>GMX · WEB.DE · Proton</span>
   </div>
   <div class="header-side">
     <button type="button" class="btn" id="remove-selected" title="Remove selected rows from the table">Remove</button>
@@ -1274,6 +1430,7 @@ PAGE = r"""<!DOCTYPE html>
       <div>
         <strong>Nothing imported</strong>
         <span>One person per line · <code>email;first;last;day;month;year;plz;city;street;password</code></span>
+        <span style="display:block">Proton · <code>name@proton.me;password</code></span>
       </div>
     </div>
     <div class="table-wrap hidden" id="queue-wrap">
@@ -1377,7 +1534,7 @@ function renderQueue() {
     const birth = [row.day, row.month, row.year].filter(Boolean).join(".");
     const place = [row.plz, row.city].filter(Boolean).join(" ");
     const pickable = canRemove(row);
-    const kind = row.kind === "webde" ? "WEB.DE" : (row.kind === "gmx" ? "GMX" : "");
+    const kind = row.kind === "webde" ? "WEB.DE" : (row.kind === "gmx" ? "GMX" : (row.kind === "proton" ? "Proton" : ""));
     return `<tr>
       <td class="check"><input class="pick" type="checkbox" value="${esc(row.id)}" ${selected.has(row.id) ? "checked" : ""} ${pickable ? "" : "disabled"}></td>
       <td><span class="who">${esc(row.first)} ${esc(row.last)}</span><span class="sub">${esc(birth)}${kind ? " · " + esc(kind) : ""}</span></td>
