@@ -88,8 +88,15 @@ echo Waiting for %NAME%
 set /a WAITED=0
 
 :wait_ready
+set "HEALTH_PORT=%PORT%"
+if /I not "%NAME%"=="sms" goto probe_health
+if not exist "%CD%\logs\sms.port" goto still_starting
+set /p HEALTH_PORT=<"%CD%\logs\sms.port"
+:probe_health
+set "HEALTH=http://127.0.0.1:%HEALTH_PORT%/health"
 curl.exe -fsS --max-time 3 -o NUL "%HEALTH%" >nul 2>&1
 if not errorlevel 1 goto service_ready
+:still_starting
 powershell -NoProfile -Command "if (Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'python' -and $_.CommandLine -and $_.CommandLine.Contains($env:SCRIPT) }) { exit 0 } else { exit 2 }"
 if errorlevel 2 (
   echo %NAME% did not stay running. See its command window.

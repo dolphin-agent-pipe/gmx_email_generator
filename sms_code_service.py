@@ -73,6 +73,7 @@ SMS_HOST = os.environ.get("SMS_HOST", "127.0.0.1").strip() or "127.0.0.1"
 SMS_CODE_PORT = int(os.environ.get("SMS_CODE_PORT", "8780") or "8780")
 DEBUG_PORT = int(os.environ.get("SMS_DEBUG_PORT", "9333") or "9333")
 HEADLESS = os.environ.get("SMS_HEADLESS", "").strip() == "1"
+PORT_FILE = ROOT / "logs" / "sms.port"
 
 
 def log(message: str) -> None:
@@ -1518,16 +1519,47 @@ class ServiceServer(ThreadingHTTPServer):
     daemon_threads = True
 
 
+def _port_busy(exc: OSError) -> bool:
+    return getattr(exc, "winerror", None) in {10013, 10048} or exc.errno in {13, 48, 98}
+
+
 def listen() -> ServiceServer:
+    """Bind the configured port, or the next free one when another process has it."""
+    reserved: set[int] = set()
+    for name, default in (("HERO_SMS_PORT", "8781"), ("ANOSIM_PORT", "8782")):
+        try:
+            reserved.add(int(os.environ.get(name, default) or default))
+        except ValueError:
+            continue
+    reserved.discard(SMS_CODE_PORT)
+    candidates: list[int] = []
+    offset = 0
+    while len(candidates) < 20 and SMS_CODE_PORT + offset <= 65535:
+        port = SMS_CODE_PORT + offset
+        offset += 1
+        if port < 1 or port in reserved or port in candidates:
+            continue
+        candidates.append(port)
     try:
-        return ServiceServer((SMS_HOST, SMS_CODE_PORT), Handler)
-    except OSError as exc:
-        busy = getattr(exc, "winerror", None) in {10013, 10048} or exc.errno in {13, 48, 98}
-        if busy:
-            raise SystemExit(
-                f"Port {SMS_CODE_PORT} is already in use. Set SMS_CODE_PORT in {ENV_FILE} to a free port."
-            ) from exc
-        raise
+        PORT_FILE.unlink()
+    except OSError:
+        pass
+    for port in candidates:
+        try:
+            server = ServiceServer((SMS_HOST, port), Handler)
+        except OSError as exc:
+            if _port_busy(exc):
+                log(f"Port {port} is already in use.")
+                continue
+            raise
+        server.actual_port = port
+        PORT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PORT_FILE.write_text(str(port), encoding="utf-8")
+        if port != SMS_CODE_PORT:
+            log(f"Port {SMS_CODE_PORT} is in use by another process. Listening on {port}.")
+        return server
+    span = f"{candidates[0]}-{candidates[-1]}" if len(candidates) > 1 else str(SMS_CODE_PORT)
+    raise SystemExit(f"Ports {span} are already in use.")
 
 
 def main() -> None:
@@ -1547,7 +1579,8 @@ def main() -> None:
     except Exception:
         server.server_close()
         raise
-    log(f"Listening on http://{SMS_HOST}:{SMS_CODE_PORT}")
+    port = int(getattr(server, "actual_port", SMS_CODE_PORT))
+    log(f"Listening on http://{SMS_HOST}:{port}")
     log(f"Ordering {wanted} German numbers per get_started call")
     try:
         server.serve_forever()
@@ -1555,6 +1588,10 @@ def main() -> None:
         log("Stopped")
     finally:
         server.server_close()
+        try:
+            PORT_FILE.unlink()
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

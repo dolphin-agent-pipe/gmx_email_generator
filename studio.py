@@ -37,6 +37,7 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -99,6 +100,9 @@ state: dict = {
 worker: threading.Thread | None = None
 inflight = 0
 store_blocked = False
+cron_lock = threading.Lock()
+cron_job_cancel: threading.Event | None = None
+cron_info = {"active": False, "message": "", "started": 0, "total": 0}
 
 
 def park_broken(path: Path) -> Path | None:
@@ -341,6 +345,9 @@ def reload_store() -> None:
 
 
 def public_state() -> dict:
+    providers = working_providers()
+    with cron_lock:
+        cron = dict(cron_info)
     with state_lock:
         done_count = sum(1 for r in state["rows"] if r.get("status") == "done")
         target = state.get("target_success", 0)
@@ -351,7 +358,7 @@ def public_state() -> dict:
             "running": state["running"],
             "provider": state["provider"],
             "kind": state["kind"],
-            "providers": [{"id": key, "label": item["label"]} for key, item in PROVIDERS.items()],
+            "providers": providers,
             "rows": list(state["rows"]),
             "history": list(state["history"]),
             "reuse_numbers": live_numbers.enabled(),
@@ -360,6 +367,7 @@ def public_state() -> dict:
             "done_count": done_count,
             "time_left": int(time_left),
             "max_concurrent": state.get("max_concurrent", 1),
+            "cron": cron,
         }
 
 
@@ -433,7 +441,7 @@ def request_json(base: str, path: str, body: dict | None = None, timeout: float 
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            payload = json.loads(response.read().decode() or "{}")
+            payload = json.loads(response.read().decode(errors="replace") or "{}")
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode(errors="replace")
         try:
@@ -445,13 +453,50 @@ def request_json(base: str, path: str, body: dict | None = None, timeout: float 
     return payload
 
 
-def provider_up(provider: str) -> bool:
-    base = PROVIDERS[provider]["base"]
+def provider_base(provider: str) -> str:
+    """Use the port the SMS service actually bound when 8780 was already taken."""
+    fallback = PROVIDERS[provider]["base"]
+    if provider != "smscode":
+        return fallback
+    path = ROOT / "logs" / "sms.port"
     try:
-        request_json(base, "/health", timeout=3)
-        return True
-    except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, RuntimeError):
+        port = int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return fallback
+    if not 1 <= port <= 65535:
+        return fallback
+    return f"http://127.0.0.1:{port}"
+
+
+def provider_up(provider: str, timeout: float = 3) -> bool:
+    try:
+        payload = request_json(provider_base(provider), "/health", timeout=timeout)
+        return payload.get("ok") is True
+    except Exception:
         return False
+
+
+_health_lock = threading.Lock()
+_health_cache = {"at": 0.0, "ids": []}
+
+
+def working_providers() -> list[dict]:
+    """Number services whose /health answers. Down services stay out of the menu."""
+    now = time.time()
+    with _health_lock:
+        if now - _health_cache["at"] < 5:
+            return [{"id": key, "label": PROVIDERS[key]["label"]} for key in _health_cache["ids"]]
+    found: list[str] = []
+    keys = list(PROVIDERS)
+    if keys:
+        with ThreadPoolExecutor(max_workers=len(keys)) as pool:
+            for key in pool.map(lambda item: item if provider_up(item, timeout=0.8) else "", keys):
+                if key:
+                    found.append(key)
+    with _health_lock:
+        _health_cache["at"] = time.time()
+        _health_cache["ids"] = found
+    return [{"id": key, "label": PROVIDERS[key]["label"]} for key in found]
 
 
 def phone_values(payload: dict) -> list[str]:
@@ -542,7 +587,7 @@ def call_service(row: dict, base: str, path: str, body: dict | None, timeout: fl
 
 def finish_numbers(provider: str, email: str, row: dict) -> bool:
     try:
-        payload = call_service(row, PROVIDERS[provider]["base"], "/code_passed", {"email": email}, 180)
+        payload = call_service(row, provider_base(provider), "/code_passed", {"email": email}, 180)
     except RowCancelled:
         raise
     except (OSError, urllib.error.URLError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
@@ -730,7 +775,7 @@ def run_row(row: dict, provider: str, kind: str) -> None:
                 ensure_active(row)
                 started = call_service(
                     row,
-                    PROVIDERS[provider]["base"],
+                    provider_base(provider),
                     "/get_started",
                     {"email": email_key, "type": kind, "count": 3, "price_index": price_index},
                     240,
@@ -764,7 +809,7 @@ def run_row(row: dict, provider: str, kind: str) -> None:
                     row["detail"] = f"Waiting for SMS on {phone}"
                     save_store()
                 console(row, f"Waiting for SMS on {phone}")
-                payload = call_service(row, PROVIDERS[provider]["base"], "/get_code", {"phone": phone}, 240)
+                payload = call_service(row, provider_base(provider), "/get_code", {"phone": phone}, 240)
                 return str(payload.get("code") or "") if payload.get("ok") else ""
 
             def log(message: str) -> None:
@@ -1088,25 +1133,15 @@ def ensure_worker() -> None:
     worker.start()
 
 
-def start_rows(provider: str, ids: list[str], target: int = 0) -> dict:
-    if provider not in PROVIDERS:
-        raise ValueError("Choose one number service")
+def _needs_sms(rows: list[dict]) -> bool:
+    return any(
+        kind_from_email(str(row.get("requested_email") or row.get("email") or "")) in {"gmx", "webde"}
+        for row in rows
+    )
+
+
+def _enqueue(provider: str, ids: list[str]) -> int:
     wanted = {str(item) for item in ids if str(item).strip()}
-    if not wanted:
-        raise RuntimeError("Select at least one row")
-    with state_lock:
-        chosen = [
-            row for row in state["rows"]
-            if row.get("id") in wanted and row.get("status") in {"ready", "failed"}
-        ]
-        needs_sms = any(
-            kind_from_email(str(row.get("requested_email") or row.get("email") or "")) in {"gmx", "webde"}
-            for row in chosen
-        )
-    if needs_sms and not provider_up(provider):
-        label = PROVIDERS[provider]["label"]
-        base = PROVIDERS[provider]["base"]
-        raise RuntimeError(f"{label} is not running at {base}")
     with state_lock:
         queued = 0
         for row in state["rows"]:
@@ -1131,10 +1166,36 @@ def start_rows(provider: str, ids: list[str], target: int = 0) -> dict:
                 console(row, "Queued Proton signup")
             else:
                 console(row, f"Queued on {PROVIDERS[provider]['label']} ({kind_label(kind)})")
-        if not queued:
-            raise RuntimeError("Select a row that is waiting or failed")
-        state["running"] = True
-        state["provider"] = provider
+        if queued:
+            state["running"] = True
+            if provider in PROVIDERS:
+                state["provider"] = provider
+            save_store()
+            ensure_worker()
+        return queued
+
+
+def start_rows(provider: str, ids: list[str], target: int = 0) -> dict:
+    wanted = {str(item) for item in ids if str(item).strip()}
+    if not wanted:
+        raise RuntimeError("Select at least one row")
+    with state_lock:
+        chosen = [
+            row for row in state["rows"]
+            if row.get("id") in wanted and row.get("status") in {"ready", "failed"}
+        ]
+        needs_sms = _needs_sms(chosen)
+    if needs_sms:
+        if provider not in PROVIDERS:
+            raise ValueError("Choose one number service")
+        if not provider_up(provider):
+            label = PROVIDERS[provider]["label"]
+            base = provider_base(provider)
+            raise RuntimeError(f"{label} is not running at {base}")
+    queued = _enqueue(provider, ids)
+    if not queued:
+        raise RuntimeError("Select a row that is waiting or failed")
+    with state_lock:
         if target > 0:
             state["target_success"] = target
             state["batch_start"] = time.time()
@@ -1143,7 +1204,123 @@ def start_rows(provider: str, ids: list[str], target: int = 0) -> dict:
             state["target_success"] = 0
             state["batch_start"] = 0.0
         save_store()
-        ensure_worker()
+    return public_state()
+
+
+def select_cron_rows(rows: list[dict], target: int) -> list[dict]:
+    chosen: list[dict] = []
+    for row in rows:
+        if row.get("status") not in {"ready", "failed"}:
+            continue
+        chosen.append(row)
+        if len(chosen) >= target:
+            break
+    return chosen
+
+
+def _parse_local_time(value: str) -> float:
+    text = str(value or "").strip()
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).timestamp()
+        except ValueError:
+            continue
+    raise ValueError("Enter a start time")
+
+
+def _cron_finish(message: str) -> None:
+    with cron_lock:
+        cron_info["active"] = False
+        cron_info["message"] = message
+
+
+def _cron_loop(provider: str, ids: list[str], batch_size: int, start_at: float, interval: int, cancel: threading.Event) -> None:
+    try:
+        while time.time() < start_at:
+            if cancel.is_set():
+                _cron_finish("Stopped")
+                return
+            time.sleep(min(0.5, max(0.0, start_at - time.time())))
+        index = 0
+        batch_no = 0
+        total = len(ids)
+        while index < total:
+            if cancel.is_set():
+                _cron_finish("Stopped")
+                return
+            batch = ids[index:index + batch_size]
+            index += len(batch)
+            batch_no += 1
+            _enqueue(provider, batch)
+            with cron_lock:
+                cron_info["started"] = index
+                cron_info["message"] = f"Batch {batch_no} started ({index}/{total})"
+            if index >= total:
+                break
+            wake = time.time() + max(0, interval)
+            while time.time() < wake:
+                if cancel.is_set():
+                    _cron_finish("Stopped")
+                    return
+                time.sleep(0.5)
+        _cron_finish(f"Finished ({total}/{total} started)")
+    except Exception as exc:
+        traceback.print_exc()
+        _cron_finish(str(exc) or "Cronjob failed")
+
+
+def start_cron(provider: str, concurrent: int, target: int, start_at: float, interval: int) -> dict:
+    if target < 1:
+        raise RuntimeError("Set Ziel Erfolge above 0")
+    if concurrent < 1 or concurrent > 20:
+        raise RuntimeError("Gleichzeitig must be between 1 and 20")
+    if interval < 0:
+        raise ValueError("Interval must be 0 or more seconds")
+    with cron_lock:
+        if cron_info["active"]:
+            raise RuntimeError("A cronjob is already running")
+        cron_info["active"] = True
+        cron_info["started"] = 0
+        cron_info["total"] = 0
+        cron_info["message"] = "Waiting for the start time"
+    try:
+        with state_lock:
+            chosen = select_cron_rows(state["rows"], target)
+            needs_sms = _needs_sms(chosen)
+            ids = [str(row.get("id") or "") for row in chosen if row.get("id")]
+        if not ids:
+            raise RuntimeError("No profiles are available to start")
+        if needs_sms:
+            if provider not in PROVIDERS:
+                raise RuntimeError("Choose a number service")
+            if not provider_up(provider):
+                raise RuntimeError(f"{PROVIDERS[provider]['label']} is not running")
+        with state_lock:
+            state["max_concurrent"] = concurrent
+        cancel = threading.Event()
+        global cron_job_cancel
+        with cron_lock:
+            cron_job_cancel = cancel
+            cron_info["total"] = len(ids)
+        threading.Thread(
+            target=_cron_loop,
+            args=(provider, ids, concurrent, start_at, interval, cancel),
+            name="studio-cron",
+            daemon=True,
+        ).start()
+    except Exception:
+        _cron_finish("")
+        raise
+    return public_state()
+
+
+def stop_cron() -> dict:
+    with cron_lock:
+        cancel = cron_job_cancel
+        if cron_info["active"]:
+            cron_info["message"] = "Stopping"
+    if cancel is not None:
+        cancel.set()
     return public_state()
 
 
@@ -1473,6 +1650,38 @@ PAGE = r"""<!DOCTYPE html>
   }
   .empty strong { display: block; margin-bottom: 6px; color: var(--ink); font-size: 14px; font-weight: 600; }
   .empty code { color: #d4d4d4; font-family: Consolas, ui-monospace, monospace; font-size: 12px; }
+  .dialog {
+    position: fixed;
+    inset: 0;
+    z-index: 5;
+    display: grid;
+    place-items: center;
+    background: rgba(0, 0, 0, 0.72);
+  }
+  .dialog-card {
+    width: min(440px, calc(100vw - 32px));
+    background: var(--surface);
+    border: 1px solid var(--line);
+    padding: 20px;
+  }
+  .dialog-card h2 { margin: 0 0 16px; font-size: 16px; font-weight: 600; }
+  .cron-facts { display: grid; grid-template-columns: 1fr auto; gap: 8px 16px; margin: 0 0 16px; }
+  .cron-facts dt { color: var(--muted); }
+  .cron-facts dd { margin: 0; text-align: right; font-weight: 600; }
+  .dialog-card label { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+  .dialog-card .locked-value { width: 220px; text-align: right; color: var(--ink); }
+  .dialog-card input {
+    width: 220px;
+    height: 32px;
+    border: 1px solid var(--line);
+    background: var(--raised);
+    color: var(--ink);
+    padding: 0 8px;
+    font: inherit;
+    color-scheme: dark;
+  }
+  .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+  #cron-note { min-height: 18px; margin: 8px 0 0; color: var(--muted); font-size: 12px; }
   .hidden { display: none; }
 </style>
 </head>
@@ -1484,6 +1693,7 @@ PAGE = r"""<!DOCTYPE html>
     <span>GMX · WEB.DE · Proton</span>
   </div>
   <div class="header-side">
+    <button type="button" class="btn" id="cronjob">Cronjob</button>
     <button type="button" class="btn" id="remove-selected" title="Remove selected rows from the table">Remove</button>
     <button type="button" class="btn" id="reload">Reload</button>
     <div class="switch" role="tablist">
@@ -1498,6 +1708,17 @@ PAGE = r"""<!DOCTYPE html>
       <div class="fields">
         <label>Service
           <select id="provider"></select>
+        </label>
+        <label>Status
+          <select id="status-filter">
+            <option value="">All</option>
+            <option value="ready">Ready</option>
+            <option value="queued">Queued</option>
+            <option value="running">Running</option>
+            <option value="done">Done</option>
+            <option value="failed">Signup failed</option>
+            <option value="pop3">POP3 failed</option>
+          </select>
         </label>
         <label class="reuse" title="After a code arrives, keep the number and use it again until it expires">
           <input id="reuse" type="checkbox">
@@ -1528,6 +1749,9 @@ PAGE = r"""<!DOCTYPE html>
         <span>One person per line · <code>email;first;last;day;month;year;plz;city;street;password</code></span>
         <span style="display:block">Proton · <code>name@proton.me;password</code></span>
       </div>
+    </div>
+    <div class="empty hidden" id="queue-filter-empty">
+      <div><strong>No rows with this status</strong></div>
     </div>
     <div class="table-wrap hidden" id="queue-wrap">
       <table>
@@ -1568,6 +1792,26 @@ PAGE = r"""<!DOCTYPE html>
     </div>
   </section>
 </main>
+</section>
+<div id="cron-dialog" class="dialog hidden">
+  <div class="dialog-card" role="dialog" aria-labelledby="cron-title">
+    <h2 id="cron-title">Cronjob</h2>
+    <dl class="cron-facts">
+      <dt>Gleichzeitig</dt><dd id="cron-concurrent">1</dd>
+      <dt>Ziel Erfolge</dt><dd id="cron-target">0</dd>
+      <dt>Available</dt><dd id="cron-available">0</dd>
+    </dl>
+    <label>Start time <input id="cron-start-time" type="datetime-local"></label>
+    <label>Interval (seconds) <input id="cron-interval" type="number" min="0" step="1" value="60"></label>
+    <label>End time <span id="cron-end" class="locked-value">—</span></label>
+    <p id="cron-note"></p>
+    <div class="dialog-actions">
+      <button type="button" class="btn" id="cron-close">Close</button>
+      <button type="button" class="btn hidden" id="cron-stop">Stop</button>
+      <button type="button" class="btn primary" id="cron-go">Start</button>
+    </div>
+  </div>
+</div>
 <script>
 const provider = document.querySelector("#provider");
 const reuse = document.querySelector("#reuse");
@@ -1630,9 +1874,16 @@ function rowAction(row) {
   return `<button type="button" class="btn row-btn" data-act="start" data-id="${esc(row.id)}">Start</button>`;
 }
 
+function visibleRows() {
+  const all = latest.rows || [];
+  const filter = document.querySelector("#status-filter").value;
+  return filter ? all.filter((row) => (row.status || "ready") === filter) : all;
+}
+
 function renderQueue() {
-  const rows = latest.rows || [];
-  const known = new Set(rows.map((row) => row.id));
+  const all = latest.rows || [];
+  const rows = visibleRows();
+  const known = new Set(all.map((row) => row.id));
   for (const id of [...selected]) if (!known.has(id)) selected.delete(id);
   queueBody.innerHTML = rows.map((row) => {
     const birth = [row.day, row.month, row.year].filter(Boolean).join(".");
@@ -1651,9 +1902,10 @@ function renderQueue() {
       <td>${rowAction(row)}</td>
     </tr>`;
   }).join("");
-  document.querySelector("#queue-empty").classList.toggle("hidden", rows.length > 0);
+  document.querySelector("#queue-empty").classList.toggle("hidden", all.length > 0);
+  document.querySelector("#queue-filter-empty").classList.toggle("hidden", all.length === 0 || rows.length > 0);
   document.querySelector("#queue-wrap").classList.toggle("hidden", rows.length === 0);
-  const counts = rows.reduce((sum, row) => { sum[row.status] = (sum[row.status] || 0) + 1; return sum; }, {});
+  const counts = all.reduce((sum, row) => { sum[row.status] = (sum[row.status] || 0) + 1; return sum; }, {});
   const bits = ["ready", "queued", "running", "done", "failed", "pop3"]
     .filter((key) => counts[key])
     .map((key) => `<span><b>${counts[key]}</b> ${esc(STATUS_LABEL[key] || key)}</span>`);
@@ -1669,18 +1921,18 @@ function renderQueue() {
     bits.push(`<span class="clock">${timeStr}</span>`);
   }
   document.querySelector("#summary").innerHTML = bits.join("");
-  const startable = rows.filter((row) => canStart(row) && selected.has(row.id));
+  const startable = all.filter((row) => canStart(row) && selected.has(row.id));
   document.querySelector("#start-selected").disabled = startable.length === 0;
-  const removable = rows.filter((row) => canRemove(row) && selected.has(row.id));
+  const removable = all.filter((row) => canRemove(row) && selected.has(row.id));
   document.querySelector("#remove-selected").disabled = removable.length === 0;
-  const exportable = rows.filter((row) => selected.has(row.id) && String(row.email || "").includes("@"));
+  const exportable = all.filter((row) => selected.has(row.id) && String(row.email || "").includes("@"));
   document.querySelector("#export-selected").disabled = exportable.length === 0;
   const pickable = rows.filter(canRemove);
   const pickAll = document.querySelector("#pick-all");
   pickAll.checked = pickable.length > 0 && pickable.every((row) => selected.has(row.id));
   pickAll.indeterminate = !pickAll.checked && pickable.some((row) => selected.has(row.id));
   pickAll.disabled = pickable.length === 0;
-  const busy = rows.some((row) => row.status === "queued" || row.status === "running");
+  const busy = all.some((row) => row.status === "queued" || row.status === "running");
   document.querySelector("#provider").disabled = busy;
 }
 
@@ -1747,16 +1999,61 @@ function renderHistory() {
   pickAll.disabled = pickable.length === 0;
 }
 
+function syncProviders() {
+  const options = latest.providers || [];
+  const signature = options.map((item) => item.id).join(",");
+  if (provider.dataset.signature === signature) return;
+  const current = provider.value || latest.provider || "";
+  provider.dataset.signature = signature;
+  provider.innerHTML = options.map((item) => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join("");
+  if (options.some((item) => item.id === current)) provider.value = current;
+  else if (options.length) provider.value = options[0].id;
+}
+
+function localStamp(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function cronSchedule() {
+  const batch = Math.max(1, parseInt(concurrent.value, 10) || 1);
+  const target = Math.max(0, parseInt(document.querySelector("#target").value, 10) || 0);
+  const startable = (latest.rows || []).filter((row) => row.status === "ready" || row.status === "failed").length;
+  const count = Math.min(target, startable);
+  const interval = Math.max(0, parseInt(document.querySelector("#cron-interval").value, 10) || 0);
+  const batches = count > 0 ? Math.ceil(count / batch) : 0;
+  return {batch, target, count, interval, batches};
+}
+
+function fillCronFacts() {
+  const plan = cronSchedule();
+  document.querySelector("#cron-concurrent").textContent = String(plan.batch);
+  document.querySelector("#cron-target").textContent = String(plan.target);
+  const available = (latest.rows || []).filter((row) => row.status !== "done").length;
+  document.querySelector("#cron-available").textContent = String(available);
+  const startValue = document.querySelector("#cron-start-time").value;
+  const start = startValue ? new Date(startValue) : null;
+  if (plan.target > 0 && plan.count > 0 && start && !Number.isNaN(start.getTime())) {
+    const end = new Date(start.getTime() + Math.max(0, plan.batches - 1) * plan.interval * 1000);
+    document.querySelector("#cron-end").textContent = localStamp(end).replace("T", " ");
+  } else {
+    document.querySelector("#cron-end").textContent = "—";
+  }
+  const cron = latest.cron || {};
+  const note = cron.message || (plan.target < 1 ? "Set Ziel Erfolge above 0" : "");
+  document.querySelector("#cron-note").textContent = note;
+  document.querySelector("#cron-stop").classList.toggle("hidden", !cron.active);
+  document.querySelector("#cron-go").disabled = !!cron.active || plan.target < 1;
+}
+
 function applyState(payload) {
   latest = payload;
-  if (!provider.options.length) {
-    provider.innerHTML = (latest.providers || []).map((item) => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join("");
-    if (latest.provider) provider.value = latest.provider;
-  }
+  syncProviders();
   if (document.activeElement !== reuse) reuse.checked = !!latest.reuse_numbers;
   if (document.activeElement !== concurrent) concurrent.value = Number(latest.max_concurrent) || 1;
   renderQueue();
   renderHistory();
+  if (!document.querySelector("#cron-dialog").classList.contains("hidden")) fillCronFacts();
 }
 
 async function refresh() {
@@ -1891,7 +2188,7 @@ document.querySelector("#delete-history").onclick = async () => {
   }
 };
 document.querySelector("#pick-all").onchange = (event) => {
-  (latest.rows || []).filter(canRemove).forEach((row) => {
+  visibleRows().filter(canRemove).forEach((row) => {
     if (event.target.checked) selected.add(row.id);
     else selected.delete(row.id);
   });
@@ -1920,6 +2217,49 @@ queueBody.addEventListener("click", (event) => {
 });
 document.querySelector("#filter-date").oninput = renderHistory;
 document.querySelector("#filter-query").oninput = renderHistory;
+document.querySelector("#status-filter").onchange = renderQueue;
+document.querySelector("#cronjob").onclick = () => {
+  const start = document.querySelector("#cron-start-time");
+  if (!start.value) start.value = localStamp(new Date());
+  document.querySelector("#cron-dialog").classList.remove("hidden");
+  fillCronFacts();
+};
+document.querySelector("#cron-close").onclick = () => {
+  document.querySelector("#cron-dialog").classList.add("hidden");
+};
+document.querySelector("#cron-start-time").oninput = fillCronFacts;
+document.querySelector("#cron-interval").oninput = fillCronFacts;
+document.querySelector("#target").oninput = fillCronFacts;
+document.querySelector("#concurrent").oninput = fillCronFacts;
+document.querySelector("#cron-go").onclick = async () => {
+  const plan = cronSchedule();
+  if (plan.target < 1) {
+    alert("Set Ziel Erfolge above 0");
+    return;
+  }
+  try {
+    const payload = await send("/api/cron/start", {
+      provider: provider.value,
+      concurrent: plan.batch,
+      target: plan.target,
+      start: document.querySelector("#cron-start-time").value,
+      interval: plan.interval,
+    });
+    viewSeq += 1;
+    applyState(payload);
+  } catch (error) {
+    alert(error.message);
+  }
+};
+document.querySelector("#cron-stop").onclick = async () => {
+  try {
+    const payload = await send("/api/cron/stop", {});
+    viewSeq += 1;
+    applyState(payload);
+  } catch (error) {
+    alert(error.message);
+  }
+};
 refresh();
 setInterval(refresh, 2000);
 </script>
@@ -2025,6 +2365,21 @@ class Handler(BaseHTTPRequestHandler):
                     state["max_concurrent"] = val
                 print(f"Max. gleichzeitig: {val}", flush=True)
                 self._send(public_state(), 200)
+                return
+            if path == "/api/cron/start":
+                self._send(
+                    start_cron(
+                        str(body.get("provider") or ""),
+                        int(body.get("concurrent") or 0),
+                        int(body.get("target") or 0),
+                        _parse_local_time(str(body.get("start") or "")),
+                        int(body.get("interval") or 0),
+                    ),
+                    200,
+                )
+                return
+            if path == "/api/cron/stop":
+                self._send(stop_cron(), 200)
                 return
             self._send({"ok": False, "error": "not found"}, 404)
         except ValueError as exc:
