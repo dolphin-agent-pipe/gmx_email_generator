@@ -102,6 +102,7 @@ inflight = 0
 store_blocked = False
 cron_lock = threading.Lock()
 cron_job_cancel: threading.Event | None = None
+cron_generation = 0
 cron_info = {"active": False, "message": "", "started": 0, "total": 0}
 
 
@@ -1228,45 +1229,68 @@ def _parse_local_time(value: str) -> float:
     raise ValueError("Enter a start time")
 
 
-def _cron_finish(message: str) -> None:
+def _cron_live(generation: int) -> bool:
     with cron_lock:
+        return generation == cron_generation
+
+
+def _cron_finish(message: str, generation: int | None = None) -> None:
+    with cron_lock:
+        if generation is not None and generation != cron_generation:
+            return
         cron_info["active"] = False
         cron_info["message"] = message
 
 
-def _cron_loop(provider: str, ids: list[str], batch_size: int, start_at: float, interval: int, cancel: threading.Event) -> None:
+def _cron_loop(
+    provider: str,
+    ids: list[str],
+    batch_size: int,
+    start_at: float,
+    interval: int,
+    cancel: threading.Event,
+    generation: int,
+) -> None:
     try:
         while time.time() < start_at:
+            if not _cron_live(generation):
+                return
             if cancel.is_set():
-                _cron_finish("Stopped")
+                _cron_finish("Stopped", generation)
                 return
             time.sleep(min(0.5, max(0.0, start_at - time.time())))
         index = 0
         batch_no = 0
         total = len(ids)
         while index < total:
+            if not _cron_live(generation):
+                return
             if cancel.is_set():
-                _cron_finish("Stopped")
+                _cron_finish("Stopped", generation)
                 return
             batch = ids[index:index + batch_size]
             index += len(batch)
             batch_no += 1
             _enqueue(provider, batch)
             with cron_lock:
+                if generation != cron_generation:
+                    return
                 cron_info["started"] = index
                 cron_info["message"] = f"Batch {batch_no} started ({index}/{total})"
             if index >= total:
                 break
             wake = time.time() + max(0, interval)
             while time.time() < wake:
+                if not _cron_live(generation):
+                    return
                 if cancel.is_set():
-                    _cron_finish("Stopped")
+                    _cron_finish("Stopped", generation)
                     return
                 time.sleep(0.5)
-        _cron_finish(f"Finished ({total}/{total} started)")
+        _cron_finish(f"Finished ({total}/{total} started)", generation)
     except Exception as exc:
         traceback.print_exc()
-        _cron_finish(str(exc) or "Cronjob failed")
+        _cron_finish(str(exc) or "Cronjob failed", generation)
 
 
 def start_cron(provider: str, concurrent: int, target: int, start_at: float, interval: int) -> dict:
@@ -1279,6 +1303,7 @@ def start_cron(provider: str, concurrent: int, target: int, start_at: float, int
     with cron_lock:
         if cron_info["active"]:
             raise RuntimeError("A cronjob is already running")
+        generation = cron_generation
         cron_info["active"] = True
         cron_info["started"] = 0
         cron_info["total"] = 0
@@ -1288,6 +1313,8 @@ def start_cron(provider: str, concurrent: int, target: int, start_at: float, int
             chosen = select_cron_rows(state["rows"], target)
             needs_sms = _needs_sms(chosen)
             ids = [str(row.get("id") or "") for row in chosen if row.get("id")]
+        if not _cron_live(generation):
+            return public_state()
         if not ids:
             raise RuntimeError("No profiles are available to start")
         if needs_sms:
@@ -1300,17 +1327,34 @@ def start_cron(provider: str, concurrent: int, target: int, start_at: float, int
         cancel = threading.Event()
         global cron_job_cancel
         with cron_lock:
+            if generation != cron_generation:
+                return public_state()
             cron_job_cancel = cancel
             cron_info["total"] = len(ids)
         threading.Thread(
             target=_cron_loop,
-            args=(provider, ids, concurrent, start_at, interval, cancel),
+            args=(provider, ids, concurrent, start_at, interval, cancel, generation),
             name="studio-cron",
             daemon=True,
         ).start()
     except Exception:
-        _cron_finish("")
+        _cron_finish("", generation)
         raise
+    return public_state()
+
+
+def reset_cron() -> dict:
+    """Drop any schedule. Opening the window starts with no cronjob."""
+    global cron_generation
+    with cron_lock:
+        cron_generation += 1
+        cancel = cron_job_cancel
+        cron_info["active"] = False
+        cron_info["message"] = ""
+        cron_info["started"] = 0
+        cron_info["total"] = 0
+    if cancel is not None:
+        cancel.set()
     return public_state()
 
 
@@ -2260,7 +2304,16 @@ document.querySelector("#cron-stop").onclick = async () => {
     alert(error.message);
   }
 };
-refresh();
+async function openStudio() {
+  try {
+    const payload = await send("/api/cron/reset", {});
+    viewSeq += 1;
+    applyState(payload);
+  } catch (error) {
+    refresh();
+  }
+}
+openStudio();
 setInterval(refresh, 2000);
 </script>
 </body>
@@ -2381,6 +2434,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/cron/stop":
                 self._send(stop_cron(), 200)
                 return
+            if path == "/api/cron/reset":
+                self._send(reset_cron(), 200)
+                return
             self._send({"ok": False, "error": "not found"}, 404)
         except ValueError as exc:
             self._send({"ok": False, "error": str(exc)}, 400)
@@ -2456,6 +2512,7 @@ class WindowApi:
 
 def main() -> None:
     load_store()
+    reset_cron()
     if port_in_use(HOST, PORT):
         raise SystemExit(
             f"Mailbox is already open on port {PORT}. Close the other Mailbox window, then run start-ui.bat again."
@@ -2492,6 +2549,7 @@ def main() -> None:
         width=1280,
         height=820,
         min_size=(980, 640),
+        maximized=True,
         background_color="#101010",
         text_select=True,
         js_api=WindowApi(),
