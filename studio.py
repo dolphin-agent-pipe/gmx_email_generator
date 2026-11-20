@@ -15,7 +15,7 @@ Each imported line is split on semicolons:
     email;first;last;day;month;year;plz;city;street;password;country
 
 The email domain chooses the signup. GMX and WEB.DE order an SMS number.
-A Proton address (proton.me, protonmail.com, or pm.me) uses proton_gen.py
+A Proton address (proton.me, protonmail.com, proton.com, or pm.me) uses proton_gen.py
 and does not order a number. Proton rows only need the address and password:
 
     name@proton.me;password
@@ -84,7 +84,7 @@ PROVIDERS = {
 }
 COLUMNS = ("email", "first", "last", "day", "month", "year", "plz", "city", "street", "password")
 EMAIL_RE = re.compile(
-    r"^[A-Za-z0-9._%+-]+@(?:web\.de|gmx\.net|gmx\.de|gmx\.com|gmx\.at|gmx\.ch|proton\.me|protonmail\.com|pm\.me)$",
+    r"^[A-Za-z0-9._%+-]+@(?:web\.de|gmx\.net|gmx\.de|gmx\.com|gmx\.at|gmx\.ch|proton\.me|protonmail\.com|proton\.com|pm\.me)$",
     re.IGNORECASE,
 )
 
@@ -470,7 +470,7 @@ def kind_from_email(email: str) -> str:
         return "webde"
     if re.search(r"@gmx\.(net|de|com|at|ch)$", addr):
         return "gmx"
-    if re.search(r"@(?:proton\.me|protonmail\.com|pm\.me)$", addr):
+    if re.search(r"@(?:proton\.me|protonmail\.com|proton\.com|pm\.me)$", addr):
         return "proton"
     return ""
 
@@ -1170,6 +1170,62 @@ def remove_rows(ids: list[str]) -> dict:
     return public_state()
 
 
+def read_accounts_file() -> list[dict]:
+    if not ACCOUNTS_FILE.is_file():
+        return []
+    try:
+        raw = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Could not read accounts.json, so nothing was deleted") from exc
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise RuntimeError("Could not read accounts.json, so nothing was deleted")
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def delete_history(emails: list[str]) -> dict:
+    wanted = {str(item).strip().lower() for item in emails if "@" in str(item)}
+    if not wanted:
+        raise RuntimeError("Select at least one mailbox")
+    with state_lock:
+        kept_history: list[dict] = []
+        removed = 0
+        for item in state["history"]:
+            email = str(item.get("email") or "").strip().lower()
+            if email and email in wanted:
+                removed += 1
+                continue
+            kept_history.append(item)
+        if not removed:
+            raise RuntimeError("Select a saved mailbox")
+        kept_rows: list[dict] = []
+        for row in state["rows"]:
+            email = str(row.get("email") or "").strip().lower()
+            if email in wanted and row.get("status") in {"done", "pop3"}:
+                continue
+            kept_rows.append(row)
+        accounts = [
+            item
+            for item in read_accounts_file()
+            if str(item.get("email") or "").strip().lower() not in wanted
+        ]
+        previous_history = state["history"]
+        previous_rows = state["rows"]
+        state["history"] = kept_history
+        state["rows"] = kept_rows
+        save_store()
+        if ACCOUNTS_FILE.is_file():
+            try:
+                write_text_atomic(ACCOUNTS_FILE, json.dumps(accounts, indent=2))
+            except OSError:
+                state["history"] = previous_history
+                state["rows"] = previous_rows
+                save_store()
+                raise
+    return public_state()
+
+
 def enable_pop3(row_id: str) -> dict:
     with state_lock:
         row = next((item for item in state["rows"] if item.get("id") == row_id), None)
@@ -1422,6 +1478,7 @@ PAGE = r"""<!DOCTYPE html>
         </label>
         <button type="button" class="btn quiet" id="clear">Clear</button>
         <button type="button" class="btn" id="import-file">Import</button>
+        <button type="button" class="btn" id="export-selected" title="Save selected mailboxes as email;password" disabled>Export</button>
         <button type="button" class="btn primary" id="start-selected">Start selected</button>
       </div>
       <input id="file" type="file" accept=".txt,.csv,text/plain" class="hidden">
@@ -1453,12 +1510,19 @@ PAGE = r"""<!DOCTYPE html>
       <label class="grow">Email or name
         <input id="filter-query" type="search" placeholder="Search">
       </label>
+      <div class="actions">
+        <button type="button" class="btn" id="export-history" title="Save selected mailboxes as email;password" disabled>Export</button>
+        <button type="button" class="btn" id="delete-history" title="Delete selected mailboxes" disabled>Delete</button>
+      </div>
     </div>
     <div class="empty" id="history-empty">No mailboxes match this search.</div>
     <div class="table-wrap hidden" id="history-wrap">
       <table>
         <thead>
-          <tr><th>Created</th><th>Email</th><th>Password</th><th>Name</th><th>Service</th><th>Phone</th></tr>
+          <tr>
+            <th class="check"><input id="history-pick-all" type="checkbox" aria-label="Select all"></th>
+            <th>Created</th><th>Email</th><th>Password</th><th>Name</th><th>Service</th><th>Phone</th>
+          </tr>
         </thead>
         <tbody id="history-body"></tbody>
       </table>
@@ -1473,6 +1537,7 @@ const historyBody = document.querySelector("#history-body");
 let latest = {rows: [], history: [], running: false};
 let viewSeq = 0;
 const selected = new Set();
+const historySelected = new Set();
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
@@ -1569,6 +1634,8 @@ function renderQueue() {
   document.querySelector("#start-selected").disabled = startable.length === 0;
   const removable = rows.filter((row) => canRemove(row) && selected.has(row.id));
   document.querySelector("#remove-selected").disabled = removable.length === 0;
+  const exportable = rows.filter((row) => selected.has(row.id) && String(row.email || "").includes("@"));
+  document.querySelector("#export-selected").disabled = exportable.length === 0;
   const pickable = rows.filter(canRemove);
   const pickAll = document.querySelector("#pick-all");
   pickAll.checked = pickable.length > 0 && pickable.every((row) => selected.has(row.id));
@@ -1576,6 +1643,10 @@ function renderQueue() {
   pickAll.disabled = pickable.length === 0;
   const busy = rows.some((row) => row.status === "queued" || row.status === "running");
   document.querySelector("#provider").disabled = busy;
+}
+
+function historyKey(item) {
+  return String(item.email || "").trim().toLowerCase();
 }
 
 function filteredHistory() {
@@ -1589,18 +1660,52 @@ function filteredHistory() {
   });
 }
 
+function mailboxLines(rows) {
+  return rows.map((item) => `${item.email || ""};${item.password || ""}`).join("\n") + "\n";
+}
+
+async function saveMailboxFile(text) {
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.export_mailboxes) {
+    await window.pywebview.api.export_mailboxes(text);
+    return;
+  }
+  const blob = new Blob([text], {type: "text/plain;charset=utf-8"});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "mailboxes.txt";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 function renderHistory() {
   const rows = filteredHistory();
-  historyBody.innerHTML = rows.map((item) => `<tr>
-    <td>${esc(item.created_at)}</td>
-    ${emailCell(item)}
-    ${textCell(item.password, "mono")}
-    <td>${esc(item.name)}</td>
-    <td>${esc(item.provider)}<span class="sub">${esc(item.kind)}</span></td>
-    ${textCell(item.phone, "mono")}
-  </tr>`).join("");
+  const known = new Set((latest.history || []).map(historyKey).filter((key) => key.includes("@")));
+  for (const key of [...historySelected]) if (!known.has(key)) historySelected.delete(key);
+  historyBody.innerHTML = rows.map((item) => {
+    const key = historyKey(item);
+    const pickable = key.includes("@");
+    return `<tr>
+      <td class="check"><input class="history-pick" type="checkbox" value="${esc(key)}" ${historySelected.has(key) ? "checked" : ""} ${pickable ? "" : "disabled"}></td>
+      <td>${esc(item.created_at)}</td>
+      ${emailCell(item)}
+      ${textCell(item.password, "mono")}
+      <td>${esc(item.name)}</td>
+      <td>${esc(item.provider)}<span class="sub">${esc(item.kind)}</span></td>
+      ${textCell(item.phone, "mono")}
+    </tr>`;
+  }).join("");
   document.querySelector("#history-empty").classList.toggle("hidden", rows.length > 0);
   document.querySelector("#history-wrap").classList.toggle("hidden", rows.length === 0);
+  document.querySelector("#export-history").disabled = historySelected.size === 0;
+  document.querySelector("#delete-history").disabled = historySelected.size === 0;
+  const pickable = rows.filter((item) => historyKey(item).includes("@"));
+  const pickAll = document.querySelector("#history-pick-all");
+  pickAll.checked = pickable.length > 0 && pickable.every((item) => historySelected.has(historyKey(item)));
+  pickAll.indeterminate = !pickAll.checked && pickable.some((item) => historySelected.has(historyKey(item)));
+  pickAll.disabled = pickable.length === 0;
 }
 
 function applyState(payload) {
@@ -1683,11 +1788,67 @@ document.querySelector("#reload").onclick = async () => {
     button.disabled = false;
   }
 };
+document.querySelector("#export-selected").onclick = async () => {
+  const rows = (latest.rows || []).filter((row) => selected.has(row.id) && String(row.email || "").includes("@"));
+  if (!rows.length) {
+    alert("Select at least one mailbox");
+    return;
+  }
+  try {
+    await saveMailboxFile(mailboxLines(rows));
+  } catch (error) {
+    alert(error.message || "Could not export");
+  }
+};
 document.querySelector("#start-selected").onclick = () => {
   const ids = (latest.rows || []).filter((row) => canStart(row) && selected.has(row.id)).map((row) => row.id);
   ids.forEach((id) => selected.delete(id));
   const target = Math.max(0, parseInt(document.querySelector("#target").value, 10) || 0);
   act("/api/start", {provider: provider.value, ids, target});
+};
+document.querySelector("#history-pick-all").onchange = (event) => {
+  filteredHistory().forEach((item) => {
+    const key = historyKey(item);
+    if (!key.includes("@")) return;
+    if (event.target.checked) historySelected.add(key);
+    else historySelected.delete(key);
+  });
+  renderHistory();
+};
+historyBody.addEventListener("change", (event) => {
+  const box = event.target.closest("input.history-pick");
+  if (!box || !box.value) return;
+  if (box.checked) historySelected.add(box.value);
+  else historySelected.delete(box.value);
+  renderHistory();
+});
+document.querySelector("#export-history").onclick = async () => {
+  const rows = (latest.history || []).filter((item) => historySelected.has(historyKey(item)));
+  if (!rows.length) {
+    alert("Select at least one mailbox");
+    return;
+  }
+  try {
+    await saveMailboxFile(mailboxLines(rows));
+  } catch (error) {
+    alert(error.message || "Could not export");
+  }
+};
+document.querySelector("#delete-history").onclick = async () => {
+  const emails = [...historySelected];
+  if (!emails.length) {
+    alert("Select at least one mailbox");
+    return;
+  }
+  const label = emails.length === 1 ? "this mailbox" : `${emails.length} mailboxes`;
+  if (!confirm(`Delete ${label}?`)) return;
+  try {
+    await send("/api/history/delete", {emails});
+    emails.forEach((email) => historySelected.delete(email));
+    await refresh();
+  } catch (error) {
+    alert(error.message);
+  }
 };
 document.querySelector("#pick-all").onchange = (event) => {
   (latest.rows || []).filter(canRemove).forEach((row) => {
@@ -1797,6 +1958,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("ids must be a list")
                 self._send(remove_rows([str(item) for item in raw_ids]), 200)
                 return
+            if path == "/api/history/delete":
+                raw_emails = body.get("emails") or []
+                if not isinstance(raw_emails, list):
+                    raise ValueError("emails must be a list")
+                self._send(delete_history([str(item) for item in raw_emails]), 200)
+                return
             if path == "/api/reload":
                 reload_store()
                 self._send(public_state(), 200)
@@ -1866,6 +2033,32 @@ def port_in_use(host: str, port: int) -> bool:
             return False
 
 
+class WindowApi:
+    def export_mailboxes(self, text: str) -> str:
+        import webview
+
+        body = text if isinstance(text, str) else ""
+        if not body.strip():
+            return ""
+        if not webview.windows:
+            raise RuntimeError("The Mailbox window is not open")
+        dialog = getattr(webview, "FileDialog", None)
+        kind = dialog.SAVE if dialog is not None else webview.SAVE_DIALOG
+        chosen = webview.windows[0].create_file_dialog(
+            kind,
+            save_filename="mailboxes.txt",
+            file_types=("Text files (*.txt)", "All files (*.*)"),
+        )
+        if not chosen:
+            return ""
+        path = Path(chosen if isinstance(chosen, str) else chosen[0])
+        if path.suffix == "":
+            path = path.with_suffix(".txt")
+        path.write_text(body if body.endswith("\n") else body + "\n", encoding="utf-8")
+        print(f"Exported mailboxes to {path}", flush=True)
+        return "saved"
+
+
 def main() -> None:
     load_store()
     if port_in_use(HOST, PORT):
@@ -1906,6 +2099,7 @@ def main() -> None:
         min_size=(980, 640),
         background_color="#0c0e12",
         text_select=True,
+        js_api=WindowApi(),
     )
     try:
         webview.start()

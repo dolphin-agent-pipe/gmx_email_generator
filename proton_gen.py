@@ -86,13 +86,34 @@ def signup_url(explicit: str = "") -> str:
     return base + "/signup"
 
 
-def normalize_username(value: str) -> str:
+PROTON_DOMAINS = ("proton.me", "protonmail.com", "proton.com", "pm.me")
+
+
+def proton_address(value: str) -> tuple[str, str]:
     text = " ".join((value or "").split())
+    domain = "proton.me"
     if "@" in text:
-        text = text.split("@", 1)[0].strip()
+        local, domain = text.split("@", 1)
+        text = local.strip()
+        domain = domain.strip().lower()
+    text = text.lower()
+    if domain not in PROTON_DOMAINS:
+        raise SystemExit("Use a proton.me, protonmail.com, or proton.com address")
     if not text or any(char.isspace() for char in text):
         raise SystemExit("Username is missing")
-    return text.lower()
+    return text, domain
+
+
+def signup_page(domain: str, explicit: str = "") -> str:
+    if domain not in PROTON_DOMAINS:
+        raise SystemExit("Use a proton.me, protonmail.com, or proton.com address")
+    if (explicit or "").strip():
+        return signup_url(explicit)
+    return signup_url("")
+
+
+def normalize_username(value: str) -> str:
+    return proton_address(value)[0]
 
 
 def mouse_drag(cdp: Cdp, x1: float, y1: float, x2: float, y2: float, session_id: str | None = None) -> None:
@@ -845,12 +866,56 @@ def captcha_ready(cdp: Cdp) -> bool:
     return bool(locate_captcha(cdp) or captcha_passed(cdp))
 
 
+def mail_plus_decline(cdp: Cdp) -> dict | None:
+    box = evaluate(
+        cdp,
+        "(() => {"
+        " const button = [...document.querySelectorAll('button.button-ghost-norm')].find((el) => {"
+        "  const label = (el.innerText || '').replace(/\\s+/g, ' ').trim();"
+        "  if (!/^nein, danke$/i.test(label) || el.disabled || el.getAttribute('aria-busy') === 'true') return false;"
+        "  const r = el.getBoundingClientRect();"
+        "  return r.width > 2 && r.height > 2;"
+        " });"
+        " if (!button) return null;"
+        " let r = button.getBoundingClientRect();"
+        " if (r.bottom < 0 || r.top > window.innerHeight) {"
+        "  button.scrollIntoView({block: 'center', inline: 'nearest'});"
+        "  r = button.getBoundingClientRect();"
+        " }"
+        " if (r.width < 2 || r.height < 2 || r.bottom < 0 || r.top > window.innerHeight) return null;"
+        " return {x: r.left + r.width / 2, y: r.top + r.height / 2};"
+        "})()",
+    )
+    return box if isinstance(box, dict) else None
+
+
+def dismiss_mail_plus(cdp: Cdp, wait: float = 3) -> bool:
+    """Decline the Mail Plus offer when it covers the form."""
+    clicked = False
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        box = mail_plus_decline(cdp)
+        if not box:
+            if clicked:
+                return True
+            time.sleep(0.3)
+            continue
+        mouse_click(cdp, float(box["x"]), float(box["y"]))
+        clear_selection(cdp)
+        if not clicked:
+            note("Clicked Nein, danke")
+        clicked = True
+        time.sleep(0.45)
+    return clicked
+
+
 def open_captcha(cdp: Cdp) -> None:
     """Submit the password form until the puzzle appears. Three misses restarts the signup."""
     for attempt in range(1, CAPTCHA_LOAD_TRIES + 1):
         stop_if_username_taken(cdp)
         if abuse_blocked(cdp):
             note("Proton blocked further signups on this network.")
+        dismiss_mail_plus(cdp, 0.6)
         if not captcha_ready(cdp):
             press_enter(cdp)
             note("Pressed Enter")
@@ -971,8 +1036,11 @@ def click_free_plan(cdp: Cdp) -> None:
         " const label = document.querySelector('#free-text');"
         " const button = label && label.closest('button');"
         " if (!button) return null;"
-        " button.scrollIntoView({block: 'center', inline: 'center'});"
-        " const r = button.getBoundingClientRect();"
+        " let r = button.getBoundingClientRect();"
+        " if (r.bottom < 0 || r.top > window.innerHeight) {"
+        "  button.scrollIntoView({block: 'center', inline: 'nearest'});"
+        "  r = button.getBoundingClientRect();"
+        " }"
         " const x = r.left + Math.min(r.width / 2, 48);"
         " const y = r.top + 36;"
         " const hit = document.elementFromPoint(x, y);"
@@ -999,7 +1067,10 @@ def click_free_plan(cdp: Cdp) -> None:
                 continue
             time.sleep(0.4)
         if attempt == 3:
-            raise SystemExit("Could not find the Free plan")
+            title = evaluate(cdp, "document.title || ''")
+            url = evaluate(cdp, "location.href || ''")
+            text = evaluate(cdp, "(document.body && document.body.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 240)")
+            raise SystemExit(f"Could not find the Free plan ({title} | {url} | {text})")
         pause = random.uniform(8, 12)
         note(f"Free plan is not on the page yet. Waiting {pause:.1f}s and opening it again ({attempt}/3)")
         widen_signup_window(cdp, "", _PROFILE_ID)
@@ -1132,8 +1203,12 @@ def main_field_point(cdp: Cdp, selector: str) -> dict | None:
         f" const el = document.querySelector({json.dumps(selector)});"
         " if (!el) return null;"
         " if (el.closest('[aria-hidden=\"true\"], .visibility-hidden')) return null;"
-        " el.scrollIntoView({block: 'center', inline: 'nearest'});"
-        " const r = el.getBoundingClientRect();"
+        " let r = el.getBoundingClientRect();"
+        " const onScreen = r.width > 2 && r.height > 2 && r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;"
+        " if (!onScreen) {"
+        "  el.scrollIntoView({block: 'center', inline: 'nearest'});"
+        "  r = el.getBoundingClientRect();"
+        " }"
         " if (r.width < 2 || r.height < 2) return null;"
         " if (r.bottom < 0 || r.right < 0 || r.left >= window.innerWidth || r.top >= window.innerHeight) return null;"
         " return {x: r.left + Math.min(28, r.width / 2), y: r.top + r.height / 2};"
@@ -1144,11 +1219,17 @@ def main_field_point(cdp: Cdp, selector: str) -> dict | None:
     return {"x": float(point["x"]), "y": float(point["y"]), "frame_id": ""}
 
 
+_LAST_USERNAME_SCROLL = 0.0
+
+
 def reveal_username(cdp: Cdp) -> str:
-    """Bring the username box into view. The Free plan click leaves it below the window."""
+    """Bring the username box into view once. Later checks leave the page where it is."""
+    global _LAST_USERNAME_SCROLL
+    allow = time.time() - _LAST_USERNAME_SCROLL >= 1.5
     state = evaluate(
         cdp,
         "(() => {"
+        f" const allow = {json.dumps(allow)};"
         " const roots = [];"
         " const visit = (node) => {"
         "  if (!node || !node.querySelectorAll) return;"
@@ -1157,6 +1238,10 @@ def reveal_username(cdp: Cdp) -> str:
         " };"
         " visit(document);"
         " const hidden = (el) => !!(el.closest && el.closest('[aria-hidden=\"true\"], .visibility-hidden'));"
+        " const visible = (el) => {"
+        "  const r = el.getBoundingClientRect();"
+        "  return r.width > 2 && r.height > 2 && r.bottom > 0 && r.top < window.innerHeight && r.right > 0 && r.left < window.innerWidth;"
+        " };"
         " let target = null;"
         " for (const root of roots) {"
         "  target = [...root.querySelectorAll('iframe')].find((el) => /name=email/i.test((el.src || '') + ' ' + (el.name || '') + ' ' + (el.title || '') + ' ' + (el.id || '')));"
@@ -1164,45 +1249,28 @@ def reveal_username(cdp: Cdp) -> str:
         " }"
         " if (!target) {"
         "  for (const root of roots) {"
-        "   target = [...root.querySelectorAll('#username')].find((el) => {"
-        "    if (hidden(el)) return false;"
-        "    const r = el.getBoundingClientRect();"
-        "    return r.width > 2 && r.height > 2;"
-        "   });"
+        "   target = [...root.querySelectorAll('#username')].find((el) => !hidden(el) && el.getBoundingClientRect().width > 2);"
         "   if (target) break;"
         "  }"
         " }"
-        " const scroller = document.scrollingElement || document.documentElement;"
+        " if (target && visible(target)) return 'ready';"
+        " if (!allow) return target ? 'moved' : 'down';"
         " if (!target) {"
+        "  const scroller = document.scrollingElement || document.documentElement;"
         "  const before = scroller.scrollTop;"
-        "  scroller.scrollBy(0, Math.round((window.innerHeight || 800) * 0.7));"
+        "  scroller.scrollBy(0, Math.round((window.innerHeight || 800) * 0.45));"
         "  return scroller.scrollTop > before + 2 ? 'down' : '';"
         " }"
         " target.scrollIntoView({block: 'center', inline: 'nearest'});"
-        " let parent = target.parentElement;"
-        " while (parent) {"
-        "  const style = getComputedStyle(parent);"
-        "  if (/(auto|scroll)/.test(style.overflowY) && parent.scrollHeight > parent.clientHeight + 8) {"
-        "   const r = target.getBoundingClientRect();"
-        "   const box = parent.getBoundingClientRect();"
-        "   if (r.top < box.top + 12 || r.bottom > box.bottom - 12) parent.scrollTop += r.top - (box.top + box.height / 2);"
-        "  }"
-        "  parent = parent.parentElement;"
-        " }"
-        " let r = target.getBoundingClientRect();"
-        " if (r.top > window.innerHeight - 48 || r.bottom < 48) {"
-        "  scroller.scrollBy(0, r.top - window.innerHeight / 2);"
-        "  r = target.getBoundingClientRect();"
-        " }"
-        " const seen = r.width > 2 && r.height > 2 && r.bottom > 0 && r.top < window.innerHeight && r.left < window.innerWidth && r.right > 0;"
-        " return seen ? 'ready' : 'moved';"
+        " return visible(target) ? 'ready' : 'moved';"
         "})()",
     )
+    if state in {"down", "moved"}:
+        _LAST_USERNAME_SCROLL = time.time()
     return str(state or "")
 
 
 def email_challenge_point(cdp: Cdp) -> dict | None:
-    reveal_username(cdp)
     frame_id = ""
     for frame in child_frames(cdp):
         url = str(frame.get("url") or "")
@@ -1228,7 +1296,6 @@ def email_challenge_point(cdp: Cdp) -> dict | None:
         "  if (frame) break;"
         " }"
         " if (!frame) return null;"
-        " frame.scrollIntoView({block: 'center', inline: 'nearest'});"
         " const r = frame.getBoundingClientRect();"
         " if (r.width < 2 || r.height < 2) return null;"
         " if (r.bottom < 0 || r.top >= window.innerHeight || r.right < 0 || r.left >= window.innerWidth) return null;"
@@ -1417,8 +1484,91 @@ def wait_for_username(cdp: Cdp) -> None:
     raise SystemExit("Could not find the username field")
 
 
-def enter_username(cdp: Cdp, username: str) -> None:
+def _email_frame(cdp: Cdp) -> tuple[str, dict | None]:
+    frame_id = ""
+    for frame in child_frames(cdp):
+        if "name=email" in str(frame.get("url") or "").lower():
+            frame_id = str(frame.get("id") or "")
+            break
+    if not frame_id:
+        return "", None
+    origin = evaluate(
+        cdp,
+        "(() => {"
+        " const frame = [...document.querySelectorAll('iframe')].find((el) => /name=email/i.test(el.src || ''));"
+        " if (!frame) return null;"
+        " const r = frame.getBoundingClientRect();"
+        " if (r.width < 2 || r.height < 2 || r.bottom < 0 || r.top >= window.innerHeight) return null;"
+        " return {left: r.left, top: r.top};"
+        "})()",
+    )
+    return frame_id, origin if isinstance(origin, dict) else None
+
+
+def _domain_choice(domain: str) -> str:
+    return (
+        "(() => {"
+        f" const wanted = {json.dumps('@' + domain)};"
+        " const button = [...document.querySelectorAll('[role=\"dialog\"] button, li button')].find((el) => {"
+        "  const text = (el.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();"
+        "  return text === wanted;"
+        " });"
+        " if (!button) return null;"
+        " const r = button.getBoundingClientRect();"
+        " if (r.width < 2 || r.height < 2 || r.bottom < 0 || r.top > window.innerHeight) return null;"
+        " return {x: r.left + r.width / 2, y: r.top + r.height / 2};"
+        "})()"
+    )
+
+
+def select_domain(cdp: Cdp, domain: str) -> None:
+    """Open the domain chevron beside the username and choose the requested ending."""
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        reveal_username(cdp)
+        frame_id, origin = _email_frame(cdp)
+        if not frame_id or not origin:
+            time.sleep(0.4)
+            continue
+        state = eval_in_frame(
+            cdp,
+            frame_id,
+            "(() => {"
+            " const button = document.querySelector('#select-domain');"
+            " if (!button) return null;"
+            " const r = button.getBoundingClientRect();"
+            " return {"
+            "  text: (button.innerText || '').replace(/\\s+/g, ' ').trim().replace(/^@/, '').toLowerCase(),"
+            "  expanded: button.getAttribute('aria-expanded') === 'true',"
+            "  x: r.right - 8,"
+            "  y: r.top + r.height / 2"
+            " };"
+            "})()",
+        )
+        if not isinstance(state, dict):
+            time.sleep(0.4)
+            continue
+        if state.get("text") == domain and not state.get("expanded"):
+            note(f"Selected @{domain}")
+            return
+        if not state.get("expanded"):
+            mouse_click_in(cdp, float(origin["left"]) + float(state["x"]), float(origin["top"]) + float(state["y"]))
+            clear_selection(cdp)
+            time.sleep(0.45)
+            continue
+        choice = evaluate(cdp, _domain_choice(domain))
+        if isinstance(choice, dict):
+            mouse_click_in(cdp, float(choice["x"]), float(choice["y"]))
+            clear_selection(cdp)
+            time.sleep(0.45)
+            continue
+        time.sleep(0.4)
+    raise SystemExit(f"Could not select @{domain}")
+
+
+def enter_username(cdp: Cdp, username: str, domain: str = "proton.me") -> None:
     wait_for_username(cdp)
+    select_domain(cdp, domain)
     fill_input(cdp, "#username", username)
     press_key(cdp, "Tab", "Tab", 9)
     clear_selection(cdp)
@@ -1447,6 +1597,7 @@ def enter_password(cdp: Cdp, password: str) -> None:
     else:
         note("No confirm-password field on this form")
     clear_selection(cdp)
+    dismiss_mail_plus(cdp)
     open_captcha(cdp)
 
 
@@ -1587,18 +1738,18 @@ def enter_display_name(cdp: Cdp, display_name: str) -> None:
     raise SystemExit("Display name was not accepted")
 
 
-def chosen_email(cdp: Cdp, username: str) -> str:
+def chosen_email(cdp: Cdp, username: str, domain: str) -> str:
     found = evaluate(
         cdp,
         "(() => {"
         " const text = document.body ? document.body.innerText : '';"
-        " const match = text.match(/[A-Za-z0-9._-]+@proton(?:mail)?\\.(?:me|com)/);"
+        " const match = text.match(/[A-Za-z0-9._-]+@(?:proton\\.me|protonmail\\.com|proton\\.com|pm\\.me)/i);"
         " return match ? match[0] : '';"
         "})()",
     )
     if found:
         return str(found)
-    return f"{username}@proton.me"
+    return f"{username}@{domain}"
 
 
 def save_proton_account(email: str, password: str) -> None:
@@ -1631,17 +1782,17 @@ def save_proton_account(email: str, password: str) -> None:
     note(f"Saved {email} to {ACCOUNTS_FILE.name}")
 
 
-def fill_proton(cdp: Cdp, username: str, password: str, display_name: str) -> str:
+def fill_proton(cdp: Cdp, username: str, password: str, display_name: str, domain: str = "proton.me") -> str:
     click_free_plan(cdp)
-    enter_username(cdp, username)
+    enter_username(cdp, username, domain)
     enter_password(cdp, password)
     solve_captcha(cdp)
-    email = f"{username}@proton.me"
+    email = f"{username}@{domain}"
     save_proton_account(email, password)
     accept_recovery_notice(cdp)
     enter_display_name(cdp, display_name)
-    email = chosen_email(cdp, username)
-    if email.lower() != f"{username}@proton.me".lower():
+    email = chosen_email(cdp, username, domain)
+    if email.lower() != f"{username}@{domain}".lower():
         save_proton_account(email, password)
     note(f"Proton mailbox ready: {email}")
     return email
@@ -1898,12 +2049,12 @@ def _run_signup(
     url: str,
 ) -> str:
     profile = normalize_profile_name(profile)
-    username = normalize_username(email)
+    username, domain = proton_address(email)
     password = (password or "").strip()
     if not password:
         raise SystemExit("Missing password")
     display_name = (display_name or "").strip() or username
-    page = signup_url(url)
+    page = signup_page(domain, url)
     proxy_path = proxies or (ROOT / "proxies.txt")
     proxy = load_random_proxy(proxy_path)
     session = requests.Session()
@@ -1921,7 +2072,7 @@ def _run_signup(
         created = ""
         for restart in range(SIGNUP_RESTARTS):
             try:
-                created = fill_proton(cdp, username, password, display_name)
+                created = fill_proton(cdp, username, password, display_name, domain)
                 break
             except SignupRestart:
                 if restart == SIGNUP_RESTARTS - 1:
@@ -1967,12 +2118,12 @@ def main() -> None:
         if not args.profile:
             raise SystemExit("Pass the profile name: python proton_gen.py reymark0227 --username reymark0227 --password 'your password'")
     profile = normalize_profile_name(args.profile)
-    username = normalize_username(ask(args.username or args.profile, "Username"))
+    username, domain = proton_address(ask(args.username or args.profile, "Username"))
     password = ask(args.password, "Password")
     display_name = (args.display_name or "").strip() or username
     generate_mailbox(
         profile,
-        f"{username}@proton.me",
+        f"{username}@{domain}",
         password,
         display_name,
         proxies=Path(args.proxies),
