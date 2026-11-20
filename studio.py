@@ -1184,25 +1184,41 @@ def read_accounts_file() -> list[dict]:
     return [item for item in raw if isinstance(item, dict)]
 
 
+def _row_matches_deleted_history(row: dict, removed_ids: set[str], removed_emails: set[str]) -> bool:
+    if row.get("status") in {"queued", "running"}:
+        return False
+    row_id = str(row.get("id") or "").strip()
+    if row_id and row_id in removed_ids:
+        return True
+    for key in ("email", "requested_email", "service_email"):
+        value = str(row.get(key) or "").strip().lower()
+        if "@" in value and value in removed_emails:
+            return True
+    return False
+
+
 def delete_history(emails: list[str]) -> dict:
     wanted = {str(item).strip().lower() for item in emails if "@" in str(item)}
     if not wanted:
         raise RuntimeError("Select at least one mailbox")
     with state_lock:
         kept_history: list[dict] = []
+        removed_ids: set[str] = set()
         removed = 0
         for item in state["history"]:
             email = str(item.get("email") or "").strip().lower()
             if email and email in wanted:
                 removed += 1
+                row_id = str(item.get("id") or "").strip()
+                if row_id:
+                    removed_ids.add(row_id)
                 continue
             kept_history.append(item)
         if not removed:
             raise RuntimeError("Select a saved mailbox")
         kept_rows: list[dict] = []
         for row in state["rows"]:
-            email = str(row.get("email") or "").strip().lower()
-            if email in wanted and row.get("status") in {"done", "pop3"}:
+            if _row_matches_deleted_history(row, removed_ids, wanted):
                 continue
             kept_rows.append(row)
         accounts = [
@@ -1278,17 +1294,25 @@ PAGE = r"""<!DOCTYPE html>
 <style>
   :root {
     color-scheme: dark;
-    --bg: #0c0e12;
-    --surface: #14171d;
-    --raised: #1c212a;
-    --ink: #e8eaef;
-    --muted: #8b93a1;
-    --faint: #5c6573;
-    --line: #2a303b;
-    --accent: #4c84f5;
-    --accent-press: #3b6fd4;
+    --bg: #101010;
+    --surface: #171717;
+    --raised: #222222;
+    --ink: #f4f4f4;
+    --muted: #a3a3a3;
+    --faint: #6e6e6e;
+    --line: #2e2e2e;
+    --accent: #f4f4f4;
+    --accent-press: #d8d8d8;
+    --on-accent: #111111;
+    --ok: #9dffc3;
+    --ok-mark: #2fce74;
+    --bad: #ffb4b4;
+    --bad-mark: #ff5a5a;
+    --warn: #ffe1a8;
+    --warn-mark: #e0a84a;
   }
-  * { box-sizing: border-box; }
+  * { box-sizing: border-box; border-radius: 0; }
+  button, input, select, textarea { box-shadow: none; }
   html, body { height: 100%; }
   body {
     margin: 0;
@@ -1309,12 +1333,13 @@ PAGE = r"""<!DOCTYPE html>
     border-bottom: 1px solid var(--line);
   }
   .brand { display: flex; align-items: center; gap: 10px; }
-  .mark { width: 8px; height: 8px; border-radius: 2px; background: var(--accent); }
+  .mark { width: 8px; height: 8px; background: var(--accent); }
   h1 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
   .brand span { color: var(--muted); font-size: 12px; }
-  .switch { display: inline-flex; padding: 2px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
-  .switch button { border: 0; background: transparent; color: var(--muted); border-radius: 6px; padding: 5px 12px; font: inherit; cursor: pointer; }
-  .switch button.active { background: var(--raised); color: var(--ink); }
+  .switch { display: inline-flex; background: var(--surface); border: 1px solid var(--line); }
+  .switch button { border: 0; border-left: 1px solid var(--line); background: transparent; color: var(--muted); padding: 6px 12px; font: inherit; cursor: pointer; }
+  .switch button:first-child { border-left: 0; }
+  .switch button.active { background: var(--ink); color: var(--bg); }
   .header-side { display: flex; align-items: center; gap: 12px; }
   main { flex: 1; min-height: 0; display: flex; padding: 16px 20px 20px; }
   .panel {
@@ -1325,7 +1350,6 @@ PAGE = r"""<!DOCTYPE html>
     flex-direction: column;
     background: var(--surface);
     border: 1px solid var(--line);
-    border-radius: 10px;
     overflow: hidden;
   }
   .bar {
@@ -1335,14 +1359,13 @@ PAGE = r"""<!DOCTYPE html>
     gap: 14px;
     padding: 10px 14px;
     border-bottom: 1px solid var(--line);
-    background: #12151b;
+    background: var(--bg);
   }
   .fields { display: flex; gap: 14px; }
   label { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; white-space: nowrap; }
   select, input[type="search"], input[type="date"] {
     height: 32px;
     border: 1px solid var(--line);
-    border-radius: 7px;
     padding: 0 10px;
     background: var(--raised);
     color: var(--ink);
@@ -1350,37 +1373,56 @@ PAGE = r"""<!DOCTYPE html>
     color-scheme: dark;
   }
   select { min-width: 128px; }
-  select:focus, input:focus { outline: none; border-color: #3d5f9e; }
+  select:focus, input:focus { outline: none; border-color: var(--muted); }
   select:disabled, input:disabled { color: var(--faint); }
   .stats { display: flex; gap: 14px; min-height: 16px; color: var(--muted); font-size: 12px; }
   .stats b { color: var(--ink); font-weight: 600; }
-  .reuse { gap: 7px; }
-  .reuse input { width: 15px; height: 15px; margin: 0; accent-color: #6ea8fe; }
+  input[type="checkbox"] {
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    margin: 0;
+    border: 1px solid var(--line);
+    background: var(--bg);
+    display: inline-grid;
+    place-content: center;
+  }
+  input[type="checkbox"]:checked { background: var(--ink); border-color: var(--ink); }
+  input[type="checkbox"]:checked::after {
+    content: "";
+    width: 7px;
+    height: 3px;
+    border-left: 2px solid var(--bg);
+    border-bottom: 2px solid var(--bg);
+    transform: rotate(-45deg) translate(0, -1px);
+  }
+  .reuse input { width: 14px; height: 14px; }
   .spacer { flex: 1; }
   .actions { display: flex; gap: 8px; }
   .btn {
     height: 32px;
     padding: 0 12px;
-    border-radius: 7px;
     border: 1px solid var(--line);
     background: var(--raised);
     color: var(--ink);
     font: inherit;
     cursor: pointer;
   }
-  .btn:hover { background: #242a34; }
-  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn:hover { background: #2a2a2a; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
   .btn.primary:hover { background: var(--accent-press); }
   .btn.quiet { border-color: transparent; background: transparent; color: var(--muted); }
   .btn.quiet:hover { background: var(--raised); color: var(--ink); }
   .btn:disabled { color: var(--faint); cursor: default; }
   .btn:disabled:hover { background: var(--raised); }
-  .btn.primary:disabled, .btn.primary:disabled:hover { background: #243044; border-color: #243044; color: #6d7888; }
+  .btn.primary:disabled, .btn.primary:disabled:hover { background: #2a2a2a; border-color: #2a2a2a; color: #6a6a6a; }
+  .stats .goal { color: var(--ok); }
+  .stats .clock { color: var(--ink); }
   .grow { flex: 1; }
   .grow input { width: 220px; max-width: 100%; }
   .table-wrap { flex: 1; min-height: 0; overflow: auto; }
   .table-wrap::-webkit-scrollbar { width: 10px; height: 10px; }
-  .table-wrap::-webkit-scrollbar-thumb { background: #303744; border-radius: 99px; }
+  .table-wrap::-webkit-scrollbar-thumb { background: #3a3a3a; }
   .table-wrap::-webkit-scrollbar-track { background: transparent; }
   table { width: 100%; min-width: 980px; border-collapse: collapse; }
   th {
@@ -1394,36 +1436,33 @@ PAGE = r"""<!DOCTYPE html>
     text-transform: uppercase;
     color: var(--faint);
     padding: 9px 14px;
-    background: #171b22;
+    background: #1c1c1c;
     border-bottom: 1px solid var(--line);
     white-space: nowrap;
   }
-  td { padding: 11px 14px; border-bottom: 1px solid #232833; vertical-align: middle; white-space: nowrap; }
-  tbody tr:hover td { background: #1a1f28; }
+  td { padding: 11px 14px; border-bottom: 1px solid #262626; vertical-align: middle; white-space: nowrap; }
+  tbody tr:hover td { background: #202020; }
   .who { font-weight: 600; }
   .sub { display: block; margin-top: 2px; color: var(--muted); font-weight: 400; font-size: 12px; }
-  .mono { font-family: Consolas, ui-monospace, monospace; font-size: 12px; color: #d5dbe6; }
+  .mono { font-family: Consolas, ui-monospace, monospace; font-size: 12px; color: #e6e6e6; }
   .detail { color: var(--muted); font-size: 12px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
   .blank { color: var(--faint); }
   .status { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); }
-  .status i { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); }
-  .status.running { color: #b9ccff; }
-  .status.running i { background: #6ea8ff; }
-  .status.done { color: #8ee0b2; }
-  .status.done i { background: #3dce8c; }
-  .status.failed { color: #f3b0b4; }
-  .status.failed i { background: #f07178; }
-  .status.pop3 { color: #f3ddb0; }
-  .status.pop3 i { background: #e2b15a; }
-  .status.queued { color: #b9ccff; }
-  .status.queued i { background: #6ea8ff; }
+  .status i { width: 6px; height: 6px; background: var(--faint); }
+  .status.running, .status.queued { color: var(--ink); }
+  .status.running i, .status.queued i { background: var(--ink); }
+  .status.done { color: var(--ok); }
+  .status.done i { background: var(--ok-mark); }
+  .status.failed { color: var(--bad); }
+  .status.failed i { background: var(--bad-mark); }
+  .status.pop3 { color: var(--warn); }
+  .status.pop3 i { background: var(--warn-mark); }
   th.check, td.check { width: 42px; text-align: center; padding-left: 12px; padding-right: 8px; }
-  input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); }
   .row-btn { height: 28px; padding: 0 10px; }
-  .row-btn.cancel { background: transparent; border-color: #6a3b3b; color: #f3b0b4; }
-  .row-btn.cancel:hover { background: #2a1c1e; }
-  .row-btn.enable { background: #2c2618; border-color: #8a6a32; color: #f3ddb0; }
-  .row-btn.enable:hover { background: #3c3422; }
+  .row-btn.cancel { background: transparent; border-color: var(--bad-mark); color: var(--bad); }
+  .row-btn.cancel:hover { background: #2a1616; }
+  .row-btn.enable { background: transparent; border-color: var(--warn-mark); color: var(--warn); }
+  .row-btn.enable:hover { background: #2a2416; }
   .empty {
     flex: 1;
     display: grid;
@@ -1433,7 +1472,7 @@ PAGE = r"""<!DOCTYPE html>
     padding: 32px;
   }
   .empty strong { display: block; margin-bottom: 6px; color: var(--ink); font-size: 14px; font-weight: 600; }
-  .empty code { color: #c5ceda; font-family: Consolas, ui-monospace, monospace; font-size: 12px; }
+  .empty code { color: #d4d4d4; font-family: Consolas, ui-monospace, monospace; font-size: 12px; }
   .hidden { display: none; }
 </style>
 </head>
@@ -1470,11 +1509,11 @@ PAGE = r"""<!DOCTYPE html>
       <div class="actions">
         <label style="display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;white-space:nowrap">
           Gleichzeitig
-          <input id="concurrent" type="number" min="1" max="20" value="1" title="Wie viele Browser-Profile gleichzeitig laufen. Empfehlung: 1–3." style="width:56px;height:32px;border:1px solid var(--line);border-radius:7px;padding:0 8px;background:var(--raised);color:var(--ink);font:inherit;color-scheme:dark">
+          <input id="concurrent" type="number" min="1" max="20" value="1" title="Wie viele Browser-Profile gleichzeitig laufen. Empfehlung: 1–3." style="width:56px;height:32px;border:1px solid var(--line);padding:0 8px;background:var(--raised);color:var(--ink);font:inherit;color-scheme:dark">
         </label>
         <label style="display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;white-space:nowrap">
           Ziel&nbsp;Erfolge
-          <input id="target" type="number" min="0" value="0" title="0 = kein Ziel. Zahl > 0: Wiederholt fehlgeschlagene Zeilen bis dieses Ziel erreicht ist (max. 24 h)." style="width:72px;height:32px;border:1px solid var(--line);border-radius:7px;padding:0 8px;background:var(--raised);color:var(--ink);font:inherit;color-scheme:dark">
+          <input id="target" type="number" min="0" value="0" title="0 = kein Ziel. Zahl > 0: Wiederholt fehlgeschlagene Zeilen bis dieses Ziel erreicht ist (max. 24 h)." style="width:72px;height:32px;border:1px solid var(--line);padding:0 8px;background:var(--raised);color:var(--ink);font:inherit;color-scheme:dark">
         </label>
         <button type="button" class="btn quiet" id="clear">Clear</button>
         <button type="button" class="btn" id="import-file">Import</button>
@@ -1626,8 +1665,8 @@ function renderQueue() {
     const h = Math.floor(tl / 3600);
     const m = Math.floor((tl % 3600) / 60);
     const timeStr = tl > 0 ? `${h}h ${m}m übrig` : "Zeit abgelaufen";
-    bits.push(`<span style="color:#8ee0b2"><b>${done}</b>/${target} Ziel</span>`);
-    bits.push(`<span style="color:#b9ccff">${timeStr}</span>`);
+    bits.push(`<span class="goal"><b>${done}</b>/${target} Ziel</span>`);
+    bits.push(`<span class="clock">${timeStr}</span>`);
   }
   document.querySelector("#summary").innerHTML = bits.join("");
   const startable = rows.filter((row) => canStart(row) && selected.has(row.id));
@@ -1843,9 +1882,10 @@ document.querySelector("#delete-history").onclick = async () => {
   const label = emails.length === 1 ? "this mailbox" : `${emails.length} mailboxes`;
   if (!confirm(`Delete ${label}?`)) return;
   try {
-    await send("/api/history/delete", {emails});
+    const payload = await send("/api/history/delete", {emails});
     emails.forEach((email) => historySelected.delete(email));
-    await refresh();
+    viewSeq += 1;
+    applyState(payload);
   } catch (error) {
     alert(error.message);
   }
@@ -2097,7 +2137,7 @@ def main() -> None:
         width=1280,
         height=820,
         min_size=(980, 640),
-        background_color="#0c0e12",
+        background_color="#101010",
         text_select=True,
         js_api=WindowApi(),
     )
