@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import os
 import random
 import struct
@@ -74,6 +75,68 @@ class SignupRestart(Exception):
     """The captcha did not load, so the signup starts again."""
 
 
+class ManualTestPause(Exception):
+    """Leave the browser open for manual signup testing."""
+
+
+def latest_env(key: str) -> str:
+    """Last assignment for key in .env wins (load_env only keeps the first)."""
+    path = gmx_gen.ENV_FILE
+    found = ""
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            name, value = raw.split("=", 1)
+            if name.strip() == key:
+                found = value.strip().strip('"').strip("'")
+    if found:
+        return found
+    return (os.environ.get(key) or "").strip()
+
+
+def manual_pause_stage() -> str:
+    """off, scroll, or password."""
+    hook = getattr(_HOOKS, "manual_pause_stage", None)
+    if hook is not None:
+        value = str(hook() or "").strip().lower()
+        if value in {"scroll", "password"}:
+            return value
+    raw = latest_env("PROTON_STOP_AFTER").lower()
+    if raw in {"scroll", "scroll-down", "down"}:
+        return "scroll"
+    if raw in {"password", "confirm", "confirm-password"}:
+        return "password"
+    legacy = latest_env("PROTON_STOP_AFTER_PASSWORD").lower()
+    if legacy in {"1", "true", "yes", "on"}:
+        return "password"
+    return "off"
+
+
+def stop_after_password_enabled() -> bool:
+    return manual_pause_stage() == "password"
+
+
+def scroll_signup_down(cdp: Cdp) -> None:
+    moved = bool(
+        evaluate(
+            cdp,
+            "(() => {"
+            " const scroller = document.scrollingElement || document.documentElement;"
+            " const before = scroller.scrollTop;"
+            " scroller.scrollBy(0, Math.round((window.innerHeight || 800) * 0.45));"
+            " return scroller.scrollTop > before + 2;"
+            "})()",
+        )
+    )
+    if moved:
+        note("Scrolled down on the signup page")
+    else:
+        note("Signup page was already scrolled")
+    time.sleep(random.uniform(0.6, 1.2))
+
+
 def signup_url(explicit: str = "") -> str:
     chosen = (explicit or "").strip()
     base = TARGET_URL2.rstrip("/")
@@ -116,7 +179,18 @@ def normalize_username(value: str) -> str:
     return proton_address(value)[0]
 
 
-def mouse_drag(cdp: Cdp, x1: float, y1: float, x2: float, y2: float, session_id: str | None = None) -> None:
+def mouse_drag(
+    cdp: Cdp,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    session_id: str | None = None,
+    *,
+    horizontal: bool = False,
+) -> None:
+    """Drag with eased motion, light jitter, and a small horizontal overshoot when needed."""
+
     def move(x: float, y: float, buttons: int = 0) -> None:
         cdp.call(
             "Input.dispatchMouseEvent",
@@ -124,40 +198,105 @@ def mouse_drag(cdp: Cdp, x1: float, y1: float, x2: float, y2: float, session_id:
             session_id=session_id,
         )
 
-    move(x1, y1)
-    time.sleep(0.12)
+    press_x = x1 + random.uniform(-1.2, 1.2)
+    press_y = y1 + random.uniform(-0.9, 0.9)
+    move(press_x, press_y)
+    time.sleep(random.uniform(0.1, 0.22))
     cdp.call(
         "Input.dispatchMouseEvent",
-        {"type": "mousePressed", "x": x1, "y": y1, "button": "left", "buttons": 1, "clickCount": 1},
+        {"type": "mousePressed", "x": press_x, "y": press_y, "button": "left", "buttons": 1, "clickCount": 1},
         session_id=session_id,
     )
-    steps = 28
+    time.sleep(random.uniform(0.06, 0.14))
+
+    dx = x2 - x1
+    dy = y2 - y1
+    mostly_horizontal = horizontal or (abs(dx) > abs(dy) * 2.2 and abs(dx) > 18)
+    steps = random.randint(40, 56)
     for index in range(1, steps + 1):
         t = index / steps
         ease = t * t * (3 - 2 * t)
-        move(x1 + (x2 - x1) * ease, y1 + (y2 - y1) * ease, 1)
-        time.sleep(0.016)
-    time.sleep(0.08)
+        lag = math.sin(t * math.pi) * random.uniform(0.8, 2.2)
+        px = x1 + dx * ease + random.uniform(-0.9, 0.9)
+        py = y1 + dy * ease + (random.uniform(-0.35, 0.35) if mostly_horizontal else random.uniform(-0.9, 0.9))
+        if mostly_horizontal:
+            py = y1 + dy * ease * 0.35 + random.uniform(-0.25, 0.25)
+        if index < steps * 0.12:
+            px -= math.copysign(lag, dx or 1.0)
+        move(px, py, 1)
+        time.sleep(random.uniform(0.011, 0.024))
+
+    release_x = x2
+    release_y = y2
+    if mostly_horizontal and abs(dx) > 12:
+        overshoot = random.uniform(1.5, 4.0) * (1.0 if dx >= 0 else -1.0)
+        overshoot_x = x2 + overshoot
+        move(overshoot_x, y2 + random.uniform(-0.3, 0.3), 1)
+        time.sleep(random.uniform(0.04, 0.1))
+        steps_back = random.randint(6, 10)
+        for index in range(1, steps_back + 1):
+            t = index / steps_back
+            ease = t * t * (3 - 2 * t)
+            move(overshoot_x + (x2 - overshoot_x) * ease, y2 + random.uniform(-0.2, 0.2), 1)
+            time.sleep(random.uniform(0.01, 0.02))
+        release_x = x2 + random.uniform(-0.6, 0.6)
+        release_y = y2 + random.uniform(-0.4, 0.4)
+    else:
+        release_x = x2 + random.uniform(-0.8, 0.8)
+        release_y = y2 + random.uniform(-0.6, 0.6)
+        move(release_x, release_y, 1)
+        time.sleep(random.uniform(0.05, 0.12))
+
     cdp.call(
         "Input.dispatchMouseEvent",
-        {"type": "mouseReleased", "x": x2, "y": y2, "button": "left", "clickCount": 1},
+        {"type": "mouseReleased", "x": release_x, "y": release_y, "button": "left", "clickCount": 1},
+        session_id=session_id,
+    )
+
+
+_LAST_POINTER: list[float] = [640.0, 420.0]
+
+
+def human_move(cdp: Cdp, x: float, y: float, session_id: str | None = None) -> tuple[float, float]:
+    target_x = x + random.uniform(-2.5, 2.5)
+    target_y = y + random.uniform(-2.0, 2.0)
+    start_x, start_y = _LAST_POINTER
+    steps = random.randint(12, 26)
+    for index in range(1, steps + 1):
+        t = index / steps
+        ease = t * t * (3 - 2 * t)
+        mx = start_x + (target_x - start_x) * ease + random.uniform(-0.8, 0.8)
+        my = start_y + (target_y - start_y) * ease + random.uniform(-0.8, 0.8)
+        cdp.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": mx, "y": my}, session_id=session_id)
+        time.sleep(random.uniform(0.008, 0.02))
+    _LAST_POINTER[:] = [target_x, target_y]
+    return target_x, target_y
+
+
+def human_click_in(cdp: Cdp, x: float, y: float, session_id: str | None = None) -> None:
+    tx, ty = human_move(cdp, x, y, session_id=session_id)
+    time.sleep(random.uniform(0.04, 0.14))
+    press_x = tx + random.uniform(-1.2, 1.2)
+    press_y = ty + random.uniform(-0.9, 0.9)
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        {"type": "mousePressed", "x": press_x, "y": press_y, "button": "left", "buttons": 1, "clickCount": 1},
+        session_id=session_id,
+    )
+    time.sleep(random.uniform(0.05, 0.14))
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        {"type": "mouseReleased", "x": press_x, "y": press_y, "button": "left", "clickCount": 1},
         session_id=session_id,
     )
 
 
 def mouse_click_in(cdp: Cdp, x: float, y: float, session_id: str | None = None) -> None:
-    cdp.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}, session_id=session_id)
-    cdp.call(
-        "Input.dispatchMouseEvent",
-        {"type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1},
-        session_id=session_id,
-    )
-    time.sleep(0.05)
-    cdp.call(
-        "Input.dispatchMouseEvent",
-        {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1},
-        session_id=session_id,
-    )
+    human_click_in(cdp, x, y, session_id=session_id)
+
+
+def human_page_click(cdp: Cdp, x: float, y: float) -> None:
+    human_click_in(cdp, x, y, session_id=None)
 
 
 def _paeth(left: int, up: int, upper_left: int) -> int:
@@ -428,6 +567,94 @@ def _bright_border(pixels: bytes, width: int, height: int, cells: list[int]) -> 
     return bright / edge
 
 
+def _mask_bbox(mask: bytearray, width: int) -> tuple[int, int, int, int] | None:
+    xs: list[int] = []
+    ys: list[int] = []
+    for index, flag in enumerate(mask):
+        if not flag:
+            continue
+        xs.append(index % width)
+        ys.append(index // width)
+    if not xs:
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _piece_shape(piece: bytes, piece_w: int, piece_h: int) -> tuple[bytes, int, float] | None:
+    pw, ph, small, scale = _shrink(piece, piece_w, piece_h, 120)
+    mask = _piece_mask(small, pw, ph)
+    if not mask:
+        return None
+    cells = [index for index, flag in enumerate(mask) if flag]
+    if len(cells) < 16:
+        return None
+    return _raster(cells, pw), pw, scale
+
+
+def _window_shape(board: bytes, board_w: int, board_h: int, cx: float, cy: float, pw: int) -> bytes | None:
+    half = max(8, pw // 2)
+    left = int(round(cx)) - half
+    top = int(round(cy)) - half
+    if left < 0 or top < 0 or left + pw > board_w or top + pw > board_h:
+        return None
+    region_w, region_h, pixels = crop_rgba(board, board_w, board_h, left, top, pw, pw)
+    if region_w < 8 or region_h < 8:
+        return None
+    holes = _hole_mask(pixels, region_w, region_h)
+    cells = [index for index, flag in enumerate(holes) if flag]
+    if len(cells) < 8:
+        mask = _piece_mask(pixels, region_w, region_h)
+        cells = [index for index, flag in enumerate(mask) if flag]
+    if len(cells) < 8:
+        return None
+    return _raster(cells, region_w)
+
+
+def refine_hole(
+    piece: bytes,
+    piece_w: int,
+    piece_h: int,
+    board: bytes,
+    board_w: int,
+    board_h: int,
+    cx: float,
+    cy: float,
+) -> tuple[float, float, float]:
+    shape_bundle = _piece_shape(piece, piece_w, piece_h)
+    if shape_bundle is None:
+        return cx, cy, 1.0
+    piece_shape, pw, _scale = shape_bundle
+    best_x = cx
+    best_y = cy
+    best_score = 1.0
+    span = max(16, int(min(board_w, piece_w) * 0.16))
+    for dx in range(-span, span + 1):
+        for dy in (-2, -1, 0, 1, 2):
+            test_x = cx + dx
+            test_y = cy + dy
+            window = _window_shape(board, board_w, board_h, test_x, test_y, pw)
+            if window is None:
+                continue
+            score = _mismatch(piece_shape, window)
+            if score < best_score:
+                best_score = score
+                best_x = test_x
+                best_y = test_y
+    return best_x, best_y, best_score
+
+
+def pointer_for_captcha(found: dict, x: float, y: float, session_id: str | None) -> tuple[float, float]:
+    if session_id:
+        return x - float(found.get("ox") or 0), y - float(found.get("oy") or 0)
+    return x, y
+
+
+def puzzle_drag_is_horizontal(piece: dict, board: dict) -> bool:
+    piece_bottom = float(piece["y"]) + float(piece["h"])
+    board_top = float(board["y"])
+    return piece_bottom <= board_top + float(board["h"]) * 0.4
+
+
 def find_hole(piece: bytes, piece_w: int, piece_h: int, board: bytes, board_w: int, board_h: int) -> tuple[float, float, float] | None:
     pw, ph, piece_small, piece_scale = _shrink(piece, piece_w, piece_h, 96)
     bw, bh, board_small, board_scale = _shrink(board, board_w, board_h, 280)
@@ -448,29 +675,38 @@ def find_hole(piece: bytes, piece_w: int, piece_h: int, board: bytes, board_w: i
             continue
         score = _mismatch(piece_shape, _raster(cells, bw))
         border = _bright_border(board_small, bw, bh, cells)
-        xs = [cell % bw for cell in cells]
-        ys = [cell // bw for cell in cells]
-        center_x = (sum(xs) / len(xs) + 0.5) / board_scale
-        center_y = (sum(ys) / len(ys) + 0.5) / board_scale
+        cell_mask = bytearray(bw * bh)
+        for cell in cells:
+            cell_mask[cell] = 1
+        bbox = _mask_bbox(cell_mask, bw)
+        if bbox is None:
+            continue
+        x0, y0, x1, y1 = bbox
+        center_x = ((x0 + x1 + 1) * 0.5) / board_scale
+        center_y = ((y0 + y1 + 1) * 0.5) / board_scale
         ranked.append((score, border, center_x, center_y))
     outlined = [item for item in ranked if item[1] >= 0.15]
     pool = outlined or ranked
     if not pool:
         return None
     score, _border, center_x, center_y = min(pool, key=lambda item: item[0])
-    return (center_x, center_y, score)
+    refined_x, refined_y, refined_score = refine_hole(piece, piece_w, piece_h, board, board_w, board_h, center_x, center_y)
+    bias = float(os.environ.get("CAPTCHA_DRAG_X_BIAS", "0") or 0)
+    return (refined_x + bias, refined_y, min(score, refined_score))
 
 
 def piece_grab(piece: bytes, piece_w: int, piece_h: int) -> tuple[float, float] | None:
-    pw, ph, small, scale = _shrink(piece, piece_w, piece_h, 96)
+    pw, ph, small, scale = _shrink(piece, piece_w, piece_h, 120)
     mask = _piece_mask(small, pw, ph)
     if not mask:
         return None
-    xs = [index % pw for index, flag in enumerate(mask) if flag]
-    ys = [index // pw for index, flag in enumerate(mask) if flag]
-    if not xs:
+    bbox = _mask_bbox(mask, pw)
+    if bbox is None:
         return None
-    return ((sum(xs) / len(xs) + 0.5) / scale, (sum(ys) / len(ys) + 0.5) / scale)
+    x0, y0, x1, y1 = bbox
+    grab_x = (x0 + (x1 - x0 + 1) * 0.58) / scale
+    grab_y = (y0 + (y1 - y0 + 1) * 0.5) / scale
+    return grab_x, grab_y
 
 
 LAYOUT_JS = r"""
@@ -788,16 +1024,13 @@ def solve_canvas(cdp: Cdp, found: dict) -> bool:
     end_y = origin_y + (board_y + hole[1]) * scale_y
     note(f"Dragging the puzzle piece from ({start_x:.0f}, {start_y:.0f}) to ({end_x:.0f}, {end_y:.0f}) (match {hole[2]:.2f})")
     session_id = frame_session(cdp, "captcha/v1/assets") or None
-    shift_x = float(found.get("ox") or 0)
-    shift_y = float(found.get("oy") or 0)
-    if session_id:
-        mouse_drag(cdp, start_x - shift_x, start_y - shift_y, end_x - shift_x, end_y - shift_y, session_id)
-        time.sleep(0.45)
-        mouse_click_in(cdp, nxt[0] - shift_x, nxt[1] - shift_y, session_id)
-    else:
-        mouse_drag(cdp, start_x, start_y, end_x, end_y, None)
-        time.sleep(0.45)
-        mouse_click_in(cdp, nxt[0], nxt[1], None)
+    drag_x1, drag_y1 = pointer_for_captcha(found, start_x, start_y, session_id)
+    drag_x2, drag_y2 = pointer_for_captcha(found, end_x, end_y, session_id)
+    horizontal = abs(drag_x2 - drag_x1) > abs(drag_y2 - drag_y1) * 2.0
+    mouse_drag(cdp, drag_x1, drag_y1, drag_x2, drag_y2, session_id, horizontal=horizontal)
+    time.sleep(random.uniform(0.35, 0.65))
+    click_x, click_y = pointer_for_captcha(found, nxt[0], nxt[1], session_id)
+    mouse_click_in(cdp, click_x, click_y, session_id)
     note("Clicked Weiter")
     return True
 
@@ -842,10 +1075,16 @@ def solve_puzzle(cdp: Cdp, found: dict) -> bool:
     start_y = piece["y"] + grab[1] / piece_h * piece["h"]
     end_x = board["x"] + hole_x / board_w * board["w"]
     end_y = board["y"] + hole_y / board_h * board["h"]
+    if puzzle_drag_is_horizontal(piece, board):
+        end_y = start_y
     note(f"Dragging the puzzle piece from ({start_x:.0f}, {start_y:.0f}) to ({end_x:.0f}, {end_y:.0f}) (match {score:.2f})")
-    mouse_drag(cdp, start_x, start_y, end_x, end_y, session_id)
-    time.sleep(0.45)
-    mouse_click_in(cdp, nxt[0], nxt[1], session_id)
+    drag_x1, drag_y1 = pointer_for_captcha(found, start_x, start_y, session_id)
+    drag_x2, drag_y2 = pointer_for_captcha(found, end_x, end_y, session_id)
+    horizontal = puzzle_drag_is_horizontal(piece, board)
+    mouse_drag(cdp, drag_x1, drag_y1, drag_x2, drag_y2, session_id, horizontal=horizontal)
+    time.sleep(random.uniform(0.35, 0.65))
+    click_x, click_y = pointer_for_captcha(found, nxt[0], nxt[1], session_id)
+    mouse_click_in(cdp, click_x, click_y, session_id)
     note("Clicked Weiter")
     return True
 
@@ -1151,16 +1390,18 @@ def key_spec(char: str) -> tuple[str, str, int, int] | None:
 
 
 def press_key(cdp: Cdp, key: str, code: str, vk: int, modifiers: int = 0, text: str = "", session_id: str | None = None) -> None:
-    down = {
-        "type": "keyDown",
+    base = {
         "key": key,
         "code": code,
         "windowsVirtualKeyCode": vk,
         "nativeVirtualKeyCode": vk,
         "modifiers": modifiers,
     }
-    cdp.call("Input.dispatchKeyEvent", down, session_id=session_id)
+    time.sleep(random.uniform(0.018, 0.055))
+    cdp.call("Input.dispatchKeyEvent", {"type": "rawKeyDown", **base}, session_id=session_id)
+    cdp.call("Input.dispatchKeyEvent", {"type": "keyDown", **base}, session_id=session_id)
     if text:
+        time.sleep(random.uniform(0.01, 0.04))
         cdp.call(
             "Input.dispatchKeyEvent",
             {
@@ -1175,25 +1416,29 @@ def press_key(cdp: Cdp, key: str, code: str, vk: int, modifiers: int = 0, text: 
             },
             session_id=session_id,
         )
-    cdp.call(
-        "Input.dispatchKeyEvent",
-        {
-            "type": "keyUp",
-            "key": key,
-            "code": code,
-            "windowsVirtualKeyCode": vk,
-            "nativeVirtualKeyCode": vk,
-            "modifiers": modifiers,
-        },
-        session_id=session_id,
-    )
+    time.sleep(random.uniform(0.03, 0.09))
+    cdp.call("Input.dispatchKeyEvent", {"type": "keyUp", **base}, session_id=session_id)
 
 
-def human_pause(longer: bool = False) -> None:
-    if longer or random.random() < 0.08:
-        time.sleep(random.uniform(0.18, 0.42))
-        return
-    time.sleep(random.uniform(0.05, 0.16))
+def typing_pause(char: str, *, field: str = "text", index: int = 0) -> None:
+    delay = random.uniform(0.08, 0.17)
+    if char.isalpha():
+        delay += random.uniform(0.01, 0.05)
+    if char in "@._-":
+        delay += random.uniform(0.05, 0.14)
+    if char in "&!?#$%^*+":
+        delay += random.uniform(0.1, 0.24)
+    if field == "username":
+        delay = random.uniform(0.1, 0.24)
+        if index > 0 and index % random.randint(4, 7) == 0:
+            time.sleep(random.uniform(0.22, 0.48))
+            return
+    elif field == "password":
+        delay = random.uniform(0.12, 0.32)
+        if index > 0 and random.random() < 0.07:
+            time.sleep(random.uniform(0.25, 0.55))
+            return
+    time.sleep(delay)
 
 
 def main_field_point(cdp: Cdp, selector: str) -> dict | None:
@@ -1211,12 +1456,67 @@ def main_field_point(cdp: Cdp, selector: str) -> dict | None:
         " }"
         " if (r.width < 2 || r.height < 2) return null;"
         " if (r.bottom < 0 || r.right < 0 || r.left >= window.innerWidth || r.top >= window.innerHeight) return null;"
-        " return {x: r.left + Math.min(28, r.width / 2), y: r.top + r.height / 2};"
+        " const jitterX = (Math.random() - 0.5) * Math.min(14, Math.max(4, r.width * 0.16));"
+        " const jitterY = (Math.random() - 0.5) * Math.min(8, Math.max(2, r.height * 0.18));"
+        " return {x: r.left + Math.min(28, r.width / 2) + jitterX, y: r.top + r.height / 2 + jitterY};"
         "})()",
     )
     if not isinstance(point, dict):
         return None
     return {"x": float(point["x"]), "y": float(point["y"]), "frame_id": ""}
+
+
+def username_local_click(cdp: Cdp, session_id: str) -> dict | None:
+    point = evaluate(
+        cdp,
+        "(() => {"
+        " const el = document.querySelector('#username');"
+        " if (!el) return null;"
+        " const r = el.getBoundingClientRect();"
+        " if (r.width < 2 || r.height < 2) return null;"
+        " const jitterX = (Math.random() - 0.5) * Math.min(16, r.width * 0.2);"
+        " const jitterY = (Math.random() - 0.5) * Math.min(10, r.height * 0.2);"
+        " return {x: r.left + r.width * 0.35 + jitterX, y: r.top + r.height / 2 + jitterY};"
+        "})()",
+        session_id=session_id,
+    )
+    if not isinstance(point, dict):
+        return None
+    return {"x": float(point["x"]), "y": float(point["y"]), "session_id": session_id, "frame_id": ""}
+
+
+def pulse_input(cdp: Cdp, selector: str, char: str, session_id: str | None) -> None:
+    if not session_id or not char:
+        return
+    evaluate(
+        cdp,
+        "(() => {"
+        f" const el = document.querySelector({json.dumps(selector)});"
+        " if (!el) return false;"
+        f" el.dispatchEvent(new InputEvent('input', {{bubbles: true, data: {json.dumps(char)}, inputType: 'insertText'}}));"
+        " el.dispatchEvent(new Event('change', {bubbles: true}));"
+        " return true;"
+        "})()",
+        session_id=session_id,
+    )
+
+
+def commit_input_value(cdp: Cdp, selector: str, text: str, session_id: str | None = None) -> str:
+    expr = (
+        "(() => {"
+        f" const el = document.querySelector({json.dumps(selector)});"
+        " if (!el) return '';"
+        " const proto = Object.getPrototypeOf(el);"
+        " const desc = Object.getOwnPropertyDescriptor(proto, 'value');"
+        f" desc.set.call(el, {json.dumps(text)});"
+        " el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertFromPaste', data: el.value}));"
+        " el.dispatchEvent(new Event('change', {bubbles: true}));"
+        " return el.value || '';"
+        "})()"
+    )
+    if session_id:
+        return str(evaluate(cdp, expr, session_id=session_id) or "")
+    return str(evaluate(cdp, expr) or "")
 
 
 _LAST_USERNAME_SCROLL = 0.0
@@ -1419,25 +1719,37 @@ def focus_field(cdp: Cdp, selector: str) -> dict:
             if state in {"down", "moved"} and not announced:
                 note("Scrolling to the username field")
                 announced = True
-                time.sleep(0.4)
+                time.sleep(random.uniform(0.35, 0.65))
         session_id = frame_session(cdp, "name=email") if selector == "#username" else ""
+        if selector == "#username" and session_id:
+            local = username_local_click(cdp, session_id)
+            if local:
+                human_click_in(cdp, float(local["x"]), float(local["y"]), session_id)
+                time.sleep(random.uniform(0.28, 0.58))
+                _value, focused = field_state(cdp, selector, "", session_id)
+                if focused:
+                    return local
         target = field_target(cdp, selector)
         if target:
-            mouse_click(cdp, float(target["x"]), float(target["y"]))
-            time.sleep(random.uniform(0.12, 0.25))
-        if session_id and focus_node(cdp, selector, session_id):
-            return {"frame_id": "", "session_id": session_id, "x": 0, "y": 0}
+            if session_id and selector == "#username":
+                time.sleep(random.uniform(0.1, 0.25))
+            else:
+                human_page_click(cdp, float(target["x"]), float(target["y"]))
+                time.sleep(random.uniform(0.2, 0.45))
         if target:
             _value, focused = field_state(cdp, selector, str(target.get("frame_id") or ""), session_id)
             if focused:
                 target["session_id"] = session_id
                 return target
+        if session_id and focus_node(cdp, selector, session_id):
+            time.sleep(random.uniform(0.12, 0.28))
+            return {"frame_id": "", "session_id": session_id, "x": 0.0, "y": 0.0}
         time.sleep(0.4)
     raise SystemExit(f"Could not focus {selector}")
 
 
-def fill_input(cdp: Cdp, selector: str, text: str) -> None:
-    """Click the visible field and type one character at a time."""
+def fill_input(cdp: Cdp, selector: str, text: str, *, field: str = "text") -> None:
+    """Click the visible field and type one character at a time with key events only."""
     deadline = time.time() + 20
     while time.time() < deadline and not field_target(cdp, selector) and not (selector == "#username" and frame_session(cdp, "name=email")):
         time.sleep(0.3)
@@ -1448,24 +1760,29 @@ def fill_input(cdp: Cdp, selector: str, text: str) -> None:
     if existing == text:
         clear_selection(cdp)
         return
+    time.sleep(random.uniform(0.15, 0.38))
     press_key(cdp, "End", "End", 35, session_id=session_id)
-    time.sleep(random.uniform(0.05, 0.12))
+    time.sleep(random.uniform(0.06, 0.15))
     for _ in range(len(existing) + 2):
         press_key(cdp, "Backspace", "Backspace", 8, session_id=session_id)
-        time.sleep(random.uniform(0.03, 0.08))
+        time.sleep(random.uniform(0.05, 0.14))
         current, _focused = field_state(cdp, selector, frame_id, session_id or "")
         if not current:
             break
-    for char in text:
+    time.sleep(random.uniform(0.12, 0.28))
+    for index, char in enumerate(text):
         spec = key_spec(char)
         if spec is None:
-            cdp.call("Input.insertText", {"text": char}, session_id=session_id)
+            press_key(cdp, char, "Unidentified", 0, 0, char, session_id)
         else:
             key, code, vk, modifiers = spec
             press_key(cdp, key, code, vk, modifiers, char, session_id)
-        human_pause()
+        pulse_input(cdp, selector, char, session_id)
+        typing_pause(char, field=field, index=index)
     clear_selection(cdp)
     typed, _focused = field_state(cdp, selector, frame_id, session_id or "")
+    if typed != text:
+        typed = commit_input_value(cdp, selector, text, session_id)
     if typed != text:
         raise SystemExit(f"{selector} was not filled")
 
@@ -1569,10 +1886,13 @@ def select_domain(cdp: Cdp, domain: str) -> None:
 def enter_username(cdp: Cdp, username: str, domain: str = "proton.me") -> None:
     wait_for_username(cdp)
     select_domain(cdp, domain)
-    fill_input(cdp, "#username", username)
-    press_key(cdp, "Tab", "Tab", 9)
+    time.sleep(random.uniform(0.55, 1.15))
+    fill_input(cdp, "#username", username, field="username")
+    time.sleep(random.uniform(0.2, 0.45))
+    session_id = frame_session(cdp, "name=email") or None
+    press_key(cdp, "Tab", "Tab", 9, session_id=session_id)
     clear_selection(cdp)
-    time.sleep(random.uniform(0.3, 0.6))
+    time.sleep(random.uniform(0.45, 0.95))
     deadline = time.time() + 8
     while time.time() < deadline:
         stop_if_username_taken(cdp)
@@ -1587,16 +1907,21 @@ def enter_password(cdp: Cdp, password: str) -> None:
         time.sleep(0.4)
     if not evaluate(cdp, "!!document.querySelector('#password')"):
         raise SystemExit("Could not find the password field")
-    fill_input(cdp, "#password", password)
-    time.sleep(random.uniform(0.25, 0.6))
+    time.sleep(random.uniform(0.35, 0.75))
+    fill_input(cdp, "#password", password, field="password")
+    time.sleep(random.uniform(0.55, 1.1))
     confirm_deadline = time.time() + 5
     while time.time() < confirm_deadline and not evaluate(cdp, "!!document.querySelector('#password-confirm')"):
         time.sleep(0.3)
     if evaluate(cdp, "!!document.querySelector('#password-confirm')"):
-        fill_input(cdp, "#password-confirm", password)
+        time.sleep(random.uniform(0.25, 0.55))
+        fill_input(cdp, "#password-confirm", password, field="password")
     else:
         note("No confirm-password field on this form")
     clear_selection(cdp)
+    if stop_after_password_enabled():
+        note("Stopped after confirm password. Dolphin browser stays open — continue signup manually.")
+        raise ManualTestPause()
     dismiss_mail_plus(cdp)
     open_captcha(cdp)
 
@@ -1784,6 +2109,10 @@ def save_proton_account(email: str, password: str) -> None:
 
 def fill_proton(cdp: Cdp, username: str, password: str, display_name: str, domain: str = "proton.me") -> str:
     click_free_plan(cdp)
+    if manual_pause_stage() == "scroll":
+        scroll_signup_down(cdp)
+        note("Stopped after scroll down. Dolphin browser stays open — continue signup manually.")
+        raise ManualTestPause()
     enter_username(cdp, username, domain)
     enter_password(cdp, password)
     solve_captcha(cdp)
@@ -2022,7 +2351,9 @@ def generate_mailbox(
     headless: bool = False,
     skip_check: bool = True,
     url: str = "",
-) -> str:
+    stop_after_password: bool | None = None,
+    stop_after: str | None = None,
+) -> str | None:
     """Open Proton signup for this address. No SMS step. Returns the created address."""
     previous_log = getattr(_HOOKS, "log", None)
     previous_stop = getattr(_HOOKS, "stop", None)
@@ -2030,11 +2361,23 @@ def generate_mailbox(
         _HOOKS.log = log
     if stop is not None:
         _HOOKS.stop = stop
+    previous_pause = getattr(_HOOKS, "manual_pause_stage", None)
+
+    def _hook_stage() -> str:
+        if stop_after:
+            return stop_after
+        if stop_after_password:
+            return "password"
+        return manual_pause_stage()
+
+    if stop_after is not None or stop_after_password is not None:
+        _HOOKS.manual_pause_stage = _hook_stage
     try:
         return _run_signup(profile, email, password, display_name, proxies, proxy_type, headless, skip_check, url)
     finally:
         _HOOKS.log = previous_log
         _HOOKS.stop = previous_stop
+        _HOOKS.manual_pause_stage = previous_pause
 
 
 def _run_signup(
@@ -2047,7 +2390,7 @@ def _run_signup(
     headless: bool,
     skip_check: bool,
     url: str,
-) -> str:
+) -> str | None:
     profile = normalize_profile_name(profile)
     username, domain = proton_address(email)
     password = (password or "").strip()
@@ -2074,6 +2417,10 @@ def _run_signup(
             try:
                 created = fill_proton(cdp, username, password, display_name, domain)
                 break
+            except ManualTestPause:
+                note(f"Left Dolphin profile {profile_id} open for manual signup")
+                _PRINT(f"Dolphin profile {profile_id} is still open", flush=True)
+                return None
             except SignupRestart:
                 if restart == SIGNUP_RESTARTS - 1:
                     raise SystemExit("Captcha did not load. Stopped after 3 restarts.")
@@ -2088,8 +2435,14 @@ def _run_signup(
                 proxy = replace_proxy(session, api, profile_id, proxy_path, proxy_type, skip_check, proxy)
                 ws, cdp, _target_id = open_browser(session, profile_id, profile, headless)
                 navigate(cdp, page)
+        if created is None:
+            return None
         if not created:
             raise SystemExit("Proton signup did not finish")
+    except ManualTestPause:
+        note(f"Left Dolphin profile {profile_id} open for manual signup")
+        _PRINT(f"Dolphin profile {profile_id} is still open", flush=True)
+        return None
     except BaseException:
         try:
             finish_profile(session, api, profile_id, cdp, ws)
@@ -2111,7 +2464,21 @@ def main() -> None:
     parser.add_argument("--proxy-type", choices=("http", "https", "socks5", "socks4"), default="http")
     parser.add_argument("--headless", action="store_true", help="Ask Dolphin to start headless")
     parser.add_argument("--skip-check", action="store_true", help="Do not ask Dolphin to test the proxy first")
+    parser.add_argument(
+        "--stop-after",
+        choices=("scroll", "password"),
+        help="Stop early for manual testing and leave the Dolphin browser open",
+    )
+    parser.add_argument(
+        "--stop-after-password",
+        action="store_true",
+        help="Same as --stop-after password",
+    )
     args = parser.parse_args()
+    if args.stop_after_password:
+        os.environ["PROTON_STOP_AFTER"] = "password"
+    elif args.stop_after:
+        os.environ["PROTON_STOP_AFTER"] = args.stop_after
     if not args.profile:
         if sys.stdin.isatty():
             args.profile = input("Dolphin profile name: ")

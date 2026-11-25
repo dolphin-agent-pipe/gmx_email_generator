@@ -45,6 +45,7 @@ ANOSIM_NUMBERS = "https://anosim.net/freenumbers/germany"
 def load_env(path: Path) -> None:
     if not path.is_file():
         return
+    values: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         raw = line.strip()
         if not raw or raw.startswith("#") or "=" not in raw:
@@ -53,7 +54,9 @@ def load_env(path: Path) -> None:
         key = key.strip()
         value = value.strip().strip('"').strip("'")
         if key:
-            os.environ.setdefault(key, value)
+            values[key] = value
+    for key, value in values.items():
+        os.environ.setdefault(key, value)
 
 
 load_env(ENV_FILE)

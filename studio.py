@@ -53,6 +53,7 @@ ACCOUNTS_FILE = ROOT / "accounts.json"
 def load_env(path: Path) -> None:
     if not path.is_file():
         return
+    values: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         raw = line.strip()
         if not raw or raw.startswith("#") or "=" not in raw:
@@ -61,7 +62,9 @@ def load_env(path: Path) -> None:
         key = key.strip()
         value = value.strip().strip('"').strip("'")
         if key:
-            os.environ.setdefault(key, value)
+            values[key] = value
+    for key, value in values.items():
+        os.environ.setdefault(key, value)
 
 
 load_env(ENV_FILE)
@@ -667,6 +670,21 @@ def run_proton_row(row: dict) -> None:
             log=log,
             stop=lambda: ensure_active(row),
         )
+        if email is None:
+            from proton_gen import manual_pause_stage
+
+            pause = manual_pause_stage()
+            detail = (
+                "Paused after scroll down — continue in Dolphin"
+                if pause == "scroll"
+                else "Paused after confirm password — continue in Dolphin"
+            )
+            with state_lock:
+                row["status"] = "running"
+                row["detail"] = detail
+                save_store()
+            console(row, row["detail"])
+            return
         created = now_stamp()
         with state_lock:
             row["status"] = "done"
